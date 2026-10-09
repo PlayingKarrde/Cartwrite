@@ -1,6 +1,7 @@
 //! Command-line front end, mainly for scripting and testing.
 //!
 //!   cartwrite-cli info  <files/folders...>
+//!   cartwrite-cli check [--titledb URL|FILE] [--refresh] <files/folders...>
 //!   cartwrite-cli build [-o DIR] [--no-rsv] [--fat32] [--deltas] [--keys FILE] <files/folders...>
 
 use std::path::PathBuf;
@@ -11,10 +12,12 @@ use cartwrite_core::build::{build_xci, BuildOptions, Progress};
 use cartwrite_core::plan::{group, output_stem};
 use cartwrite_core::rsv::format_rsv;
 use cartwrite_core::scan::{collect_files, scan_file, Title};
-use cartwrite_core::util::format_size;
+use cartwrite_core::titledb::{self, Report, DEFAULT_SOURCE};
+use cartwrite_core::util::{format_age as age, format_size};
 use cartwrite_core::Keys;
 
 const USAGE: &str = "usage: cartwrite-cli info <files...>
+       cartwrite-cli check [--titledb URL|FILE] [--refresh] <files...>
        cartwrite-cli build [-o DIR] [--no-rsv] [--fat32] [--deltas] [--keys FILE] <files...>";
 
 fn main() {
@@ -35,6 +38,8 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
     let mut out_dir: Option<PathBuf> = None;
     let mut keys_path: Option<PathBuf> = None;
     let mut opts = BuildOptions::default();
+    let mut titledb_source = DEFAULT_SOURCE.to_string();
+    let mut refresh = false;
     let mut inputs = Vec::new();
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -43,11 +48,13 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
             "--no-rsv" => opts.patch_rsv = false,
             "--fat32" => opts.split_fat32 = true,
             "--deltas" => opts.include_deltas = true,
+            "--titledb" => titledb_source = args.next().ok_or("--titledb needs a URL or file")?,
+            "--refresh" => refresh = true,
             flag if flag.starts_with('-') => return Err(format!("unknown option {flag}\n{USAGE}").into()),
             _ => inputs.push(PathBuf::from(a)),
         }
     }
-    if !matches!(cmd.as_str(), "info" | "build") || inputs.is_empty() {
+    if !matches!(cmd.as_str(), "info" | "check" | "build") || inputs.is_empty() {
         eprintln!("{USAGE}");
         std::process::exit(2);
     }
@@ -64,6 +71,23 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
     }
     let games = group(titles);
 
+    let db = if cmd == "check" {
+        let (db, err) = titledb::load(&titledb_source, refresh);
+        match (&db, err) {
+            (Some(db), Some(e)) => eprintln!(
+                "warning: couldn't refresh the title database ({e}); using the cached copy from {}",
+                age(db.fetched)
+            ),
+            (None, Some(e)) => return Err(format!("couldn't get the title database from {titledb_source}: {e}").into()),
+            _ => {}
+        }
+        let db = db.ok_or("no title database")?;
+        println!("Title database: {} titles, updated {} ({})", db.len(), age(db.fetched), db.source);
+        Some(db)
+    } else {
+        None
+    };
+
     for g in &games {
         println!("\n{} [{:016X}] {}", g.name, g.application_id, g.display_version.as_deref().unwrap_or(""));
         for t in &g.titles {
@@ -74,6 +98,12 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
         }
         for w in g.warnings() {
             println!("  ! {w}");
+        }
+        if let Some(db) = &db {
+            match db.check(g) {
+                None => println!("  ? not in the title database"),
+                Some(r) => print_report(&r),
+            }
         }
     }
 
@@ -112,6 +142,24 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
         }
     }
     Ok(all_ok)
+}
+
+fn print_report(r: &Report) {
+    if r.is_up_to_date() {
+        println!("  = up to date");
+    }
+    if let Some((have, latest)) = r.newer_update {
+        match have {
+            Some(v) => println!("  > newer update available: v{latest} (you have v{v})"),
+            None => println!("  > update available: v{latest} (you have none)"),
+        }
+    }
+    for id in &r.missing_dlc {
+        println!("  > missing DLC {id:016X}");
+    }
+    for (id, have, latest) in &r.outdated_dlc {
+        println!("  > newer DLC {id:016X}: v{latest} (you have v{have})");
+    }
 }
 
 fn print_title(prefix: &str, t: &Title) {

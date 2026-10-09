@@ -12,6 +12,7 @@ use std::time::Instant;
 
 use cartwrite_core::build::{build_xci, BuildOptions, Progress};
 use cartwrite_core::scan::{collect_files, scan_file, Title};
+use cartwrite_core::titledb::{self, TitleDb};
 use cartwrite_core::{Error, Keys};
 
 pub enum ScanMsg {
@@ -30,6 +31,23 @@ pub fn spawn_scan(ctx: eframe::egui::Context, keys: Arc<Keys>, paths: Vec<PathBu
             ctx.request_repaint();
         }
         let _ = tx.send(ScanMsg::Done);
+        ctx.request_repaint();
+    });
+    rx
+}
+
+/// Result of loading the title database: what's available, and the refresh error if any.
+pub type TitleDbResult = (Option<TitleDb>, Option<String>);
+
+/// Loads the title database in the background (cache first, download if stale or forced).
+pub fn spawn_titledb(ctx: eframe::egui::Context, source: String, force: bool) -> Receiver<TitleDbResult> {
+    let (tx, rx) = channel();
+    std::thread::spawn(move || {
+        let result: Result<TitleDbResult, String> = guarded(|| {
+            let (db, err) = titledb::load(&source, force);
+            Ok((db, err.map(|e| e.to_string())))
+        });
+        let _ = tx.send(result.unwrap_or_else(|e| (None, Some(e))));
         ctx.request_repaint();
     });
     rx

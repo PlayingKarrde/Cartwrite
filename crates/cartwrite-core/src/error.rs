@@ -25,6 +25,9 @@ pub enum Error {
     #[error("{0}")]
     Unsupported(String),
 
+    #[error("{0}")]
+    Network(String),
+
     #[error("cancelled")]
     Cancelled,
 }

@@ -144,7 +144,7 @@ fn name_from_file(t: &Title) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::container::ContainerKind;
     use crate::nacp::Nacp;
@@ -152,7 +152,7 @@ mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
 
-    fn title(kind: TitleKind, title_id: u64, version: u32, display: Option<&str>) -> Title {
+    pub(crate) fn title(kind: TitleKind, title_id: u64, version: u32, display: Option<&str>) -> Title {
         let source = Arc::new(PathBuf::from(format!("{title_id:016x}_v{version}.nsp")));
         let meta = NcaRef {
             source: source.clone(),

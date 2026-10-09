@@ -10,12 +10,13 @@ use cartwrite_core::container::ContainerKind;
 use cartwrite_core::plan::{group, output_stem, Game};
 use cartwrite_core::rsv::format_rsv;
 use cartwrite_core::scan::{Title, TitleKind, EXTENSIONS};
-use cartwrite_core::util::format_size;
+use cartwrite_core::titledb::{self, Report, TitleDb};
+use cartwrite_core::util::{format_age, format_size};
 use cartwrite_core::Keys;
 use eframe::egui::{self, Color32, RichText};
 
 use crate::theme::{self, ThemeChoice, ThemeStyle};
-use crate::worker::{spawn_build, spawn_scan, BuildJob, BuildMsg, ScanMsg};
+use crate::worker::{spawn_build, spawn_scan, spawn_titledb, BuildJob, BuildMsg, ScanMsg, TitleDbResult};
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -30,6 +31,10 @@ struct Settings {
     last_dir: Option<PathBuf>,
     theme: ThemeChoice,
     style: ThemeStyle,
+    /// Compare games with a title database to spot newer updates and missing DLC.
+    check_updates: bool,
+    /// URL or local file of a titledb `versions.txt`.
+    titledb_source: String,
 }
 
 impl Default for Settings {
@@ -44,6 +49,8 @@ impl Default for Settings {
             last_dir: None,
             theme: ThemeChoice::Dark,
             style: ThemeStyle::Nx,
+            check_updates: false,
+            titledb_source: titledb::DEFAULT_SOURCE.into(),
         }
     }
 }
@@ -102,6 +109,17 @@ pub struct App {
     scanned: HashSet<PathBuf>,
     logo: Option<(Color32, egui::TextureHandle)>,
     debug: DebugHooks,
+    titledb: TitleDbState,
+}
+
+/// The optional update / DLC check's database and its loading state.
+#[derive(Default)]
+struct TitleDbState {
+    db: Option<Arc<TitleDb>>,
+    /// Source the current load was started for (to notice when the setting changes).
+    source: String,
+    rx: Option<Receiver<TitleDbResult>>,
+    error: Option<String>,
 }
 
 /// Developer aids driven by environment variables (used to screenshot the UI headlessly).
@@ -111,8 +129,12 @@ struct DebugHooks {
     screenshot: Option<PathBuf>,
     /// `CARTWRITE_DEBUG_BUILD`: start "Build all" shortly after launch.
     auto_build: bool,
-    /// `CARTWRITE_DEBUG_SETTINGS`: open the settings dialog on launch.
+    /// `CARTWRITE_DEBUG_SETTINGS`: open the settings dialog on launch
+    /// (`=updates` also scrolls it to the update check section).
     open_settings: bool,
+    scroll_to_updates: bool,
+    /// `CARTWRITE_DEBUG_TITLEDB=<source>`: turn the update check on with this source.
+    titledb: Option<String>,
     // `CARTWRITE_DEBUG_THEME=light` is applied in `App::new` without touching saved settings.
 }
 
@@ -122,6 +144,8 @@ impl DebugHooks {
             screenshot: std::env::var_os("CARTWRITE_SCREENSHOT").map(PathBuf::from),
             auto_build: std::env::var_os("CARTWRITE_DEBUG_BUILD").is_some(),
             open_settings: std::env::var_os("CARTWRITE_DEBUG_SETTINGS").is_some(),
+            scroll_to_updates: std::env::var("CARTWRITE_DEBUG_SETTINGS").as_deref() == Ok("updates"),
+            titledb: std::env::var("CARTWRITE_DEBUG_TITLEDB").ok(),
         }
     }
 }
@@ -151,8 +175,16 @@ impl App {
             scanned: HashSet::new(),
             logo: None,
             debug: DebugHooks::from_env(),
+            titledb: TitleDbState::default(),
         };
         app.show_settings = app.debug.open_settings;
+        if let Some(source) = app.debug.titledb.clone() {
+            app.settings.check_updates = true;
+            app.settings.titledb_source = source;
+        }
+        if app.settings.check_updates {
+            app.load_titledb(&cc.egui_ctx, false);
+        }
         app.load_keys();
         // Files passed on the command line / dropped onto the exe.
         let args: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
@@ -179,6 +211,44 @@ impl App {
                     self.keys_error = Some(format!("{}: {e}", p.display()));
                 }
             },
+        }
+    }
+
+    /// Starts loading the title database in the background (cache first unless `force`).
+    fn load_titledb(&mut self, ctx: &egui::Context, force: bool) {
+        let source = self.settings.titledb_source.trim().to_string();
+        if source != self.titledb.source {
+            self.titledb.db = None;
+        }
+        self.titledb.source = source.clone();
+        self.titledb.error = None;
+        self.titledb.rx = Some(spawn_titledb(ctx.clone(), source, force));
+    }
+
+    fn poll_titledb(&mut self) {
+        let Some(rx) = &self.titledb.rx else { return };
+        let result = match rx.try_recv() {
+            Ok(r) => r,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => (None, Some("the download stopped unexpectedly".into())),
+        };
+        self.titledb.rx = None;
+        let (db, err) = result;
+        if let Some(db) = db {
+            self.titledb.db = Some(Arc::new(db));
+        }
+        if let Some(e) = &err {
+            self.log(format!("Title database: {e}"), false);
+        }
+        self.titledb.error = err;
+    }
+
+    /// The database to check games against, if the feature is on and a copy is loaded.
+    fn active_titledb(&self) -> Option<Arc<TitleDb>> {
+        if self.settings.check_updates {
+            self.titledb.db.clone()
+        } else {
+            None
         }
     }
 
@@ -259,6 +329,7 @@ impl App {
     }
 
     fn poll(&mut self, ctx: &egui::Context) {
+        self.poll_titledb();
         if let Some(rx) = &self.scan_rx {
             let mut changed = false;
             let mut done = false;
@@ -772,6 +843,7 @@ impl App {
         let job_running = self.job.is_some();
         let out_dir = self.settings.output_dir.clone();
         let deltas = self.settings.include_deltas;
+        let titledb = self.active_titledb();
         let mut build_one = None;
         let mut remove = None;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
@@ -782,7 +854,7 @@ impl App {
                         g.chosen().first().and_then(|t| t.source.parent().map(Path::to_path_buf)).unwrap_or_default()
                     }
                 };
-                match game_card(ui, g, job_running, &dir, deltas) {
+                match game_card(ui, g, job_running, &dir, deltas, titledb.as_deref()) {
                     CardAction::None => {}
                     CardAction::Build => build_one = Some(g.game.application_id),
                     CardAction::Remove => remove = Some(i),
@@ -808,10 +880,71 @@ impl App {
         }
     }
 
+    /// Source field, refresh button and status for the update check (inside Settings).
+    fn titledb_settings(&mut self, ui: &mut egui::Ui, p: &theme::Palette, action: &mut Option<bool>) {
+        ui.add_space(2.0);
+        ui.label(RichText::new("Title database source").color(p.text_dim));
+        let field = ui.add(
+            egui::TextEdit::singleline(&mut self.settings.titledb_source)
+                .hint_text(titledb::DEFAULT_SOURCE)
+                .desired_width(ui.available_width()),
+        );
+        let changed = self.settings.titledb_source.trim() != self.titledb.source;
+        if field.lost_focus() && changed {
+            *action = Some(false);
+        }
+        ui.label(
+            RichText::new(
+                "A URL or a local file in titledb's versions.txt format (one id|rightsId|version line per title). \
+                 versions.json also works but has no DLC list.",
+            )
+            .size(12.0)
+            .color(p.text_faint),
+        );
+        ui.add_space(4.0);
+        let loading = self.titledb.rx.is_some();
+        ui.horizontal(|ui| {
+            if theme::secondary_button(ui, !loading, "Refresh now").clicked() {
+                *action = Some(true);
+            }
+            if self.settings.titledb_source.trim() != titledb::DEFAULT_SOURCE
+                && theme::ghost_button(ui, !loading, "Use default source").clicked()
+            {
+                self.settings.titledb_source = titledb::DEFAULT_SOURCE.into();
+                *action = Some(false);
+            }
+        });
+        ui.add_space(2.0);
+        ui.horizontal_wrapped(|ui| {
+            if loading {
+                ui.spinner();
+                ui.label(RichText::new("Loading the title database…").color(p.text_dim));
+                return;
+            }
+            if let Some(db) = &self.titledb.db {
+                status_pill(ui, p.ok, "Ready");
+                let dlc = if db.has_dlc_info() { "" } else { " (no DLC info in this source)" };
+                ui.label(
+                    RichText::new(format!("{} titles, updated {}{dlc}", db.len(), format_age(db.fetched)))
+                        .color(p.text_dim),
+                );
+            }
+            if let Some(e) = &self.titledb.error {
+                let msg = if self.titledb.db.is_some() {
+                    format!("Couldn't refresh ({e}), so the copy above is being used.")
+                } else {
+                    format!("Couldn't load the title database: {e}")
+                };
+                ui.label(RichText::new(msg).color(p.err));
+            }
+        });
+    }
+
     fn settings_modal(&mut self, ctx: &egui::Context) {
         let p = theme::palette_for(theme::style(), ctx.theme() == egui::Theme::Dark);
         let mut close = false;
         let mut reload = false;
+        let mut titledb_action: Option<bool> = None; // Some(force) to (re)load the database
         let frame = egui::Frame::new()
             .fill(p.panel)
             .stroke(egui::Stroke::new(1.0, p.border))
@@ -903,6 +1036,24 @@ impl App {
                     "Delete the old XCI after rebuilding it",
                     "When updating an existing XCI, remove the old file once the new one is written.",
                 );
+
+                section(ui, "UPDATE CHECK");
+                if self.debug.scroll_to_updates {
+                    ui.scroll_to_cursor(Some(egui::Align::TOP));
+                }
+                let was_on = self.settings.check_updates;
+                setting_toggle(
+                    ui,
+                    &mut self.settings.check_updates,
+                    "Check for newer updates and missing DLC",
+                    "Compares your games with a community title database. Nothing is downloaded while this is off.",
+                );
+                if self.settings.check_updates && !was_on {
+                    titledb_action = Some(false);
+                }
+                if self.settings.check_updates {
+                    self.titledb_settings(ui, &p, &mut titledb_action);
+                }
             });
             ui.add_space(14.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -913,6 +1064,9 @@ impl App {
         });
         if close || modal.should_close() {
             self.show_settings = false;
+        }
+        if let Some(force) = titledb_action {
+            self.load_titledb(ctx, force);
         }
         if reload {
             self.load_keys();
@@ -986,7 +1140,14 @@ fn kind_color(p: &theme::Palette, kind: TitleKind) -> Color32 {
     }
 }
 
-fn game_card(ui: &mut egui::Ui, g: &mut GameView, busy: bool, out_dir: &Path, deltas: bool) -> CardAction {
+fn game_card(
+    ui: &mut egui::Ui,
+    g: &mut GameView,
+    busy: bool,
+    out_dir: &Path,
+    deltas: bool,
+    titledb: Option<&TitleDb>,
+) -> CardAction {
     let p = theme::palette(ui);
     let mut action = CardAction::None;
     let id = egui::Id::new(("card", g.game.application_id));
@@ -1004,7 +1165,7 @@ fn game_card(ui: &mut egui::Ui, g: &mut GameView, busy: bool, out_dir: &Path, de
     let resp = frame.show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
-            check_circle(ui, &mut g.selected, !busy, 22.0).on_hover_text("Include in “Build all”");
+            check_circle(ui, &mut g.selected, !busy, 22.0).on_hover_text("Include when building all selected games");
             ui.add_space(2.0);
             let size = egui::vec2(84.0, 84.0);
             let alpha = 0.45 + 0.55 * selected_t;
@@ -1077,6 +1238,9 @@ fn game_card(ui: &mut egui::Ui, g: &mut GameView, busy: bool, out_dir: &Path, de
                     ui.add_space(4.0);
                     ui.label(RichText::new(format_size(size)).color(p.text_dim));
                 });
+                if let Some(db) = titledb {
+                    update_check_pills(ui, &p, db, db.check(&g.game));
+                }
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if theme::icon_button(ui, !busy, "✕", "Remove from list").clicked() {
@@ -1195,6 +1359,56 @@ fn game_card(ui: &mut egui::Ui, g: &mut GameView, busy: bool, out_dir: &Path, de
         ui.ctx().data_mut(|d| d.insert_temp(id, hovered_now));
     }
     action
+}
+
+/// Result of the optional update / DLC check on a game card.
+fn update_check_pills(ui: &mut egui::Ui, p: &theme::Palette, db: &TitleDb, report: Option<Report>) {
+    let updated = format!("Title database updated {}.", format_age(db.fetched));
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        let Some(r) = report else {
+            theme::pill(ui, "Not in title database", p.text_faint).on_hover_text(format!(
+                "The title database doesn't list this game, so it can't be checked.\n{updated}"
+            ));
+            return;
+        };
+        if r.is_up_to_date() {
+            theme::pill(ui, "Up to date", p.ok).on_hover_text(format!(
+                "You have the newest update and every DLC the title database lists.\n{updated}"
+            ));
+            return;
+        }
+        if let Some((have, latest)) = r.newer_update {
+            let have = match have {
+                Some(v) => format!("Your newest update is v{v}."),
+                None => "You don't have an update for this game.".into(),
+            };
+            theme::pill(ui, "Newer update available", p.warn).on_hover_text(format!(
+                "The title database lists update v{latest} (update #{}). {have}\n{updated}",
+                latest >> 16
+            ));
+        }
+        if !r.missing_dlc.is_empty() {
+            let n = r.missing_dlc.len();
+            let mut list: Vec<String> = r.missing_dlc.iter().take(12).map(|id| format!("{id:016X}")).collect();
+            if n > 12 {
+                list.push(format!("and {} more", n - 12));
+            }
+            theme::pill(ui, format!("{n} DLC missing"), p.warn).on_hover_text(format!(
+                "DLC the title database lists that none of your files contain:\n{}\n{updated}",
+                list.join("\n")
+            ));
+        }
+        if !r.outdated_dlc.is_empty() {
+            let list: Vec<String> = r
+                .outdated_dlc
+                .iter()
+                .map(|(id, have, latest)| format!("{id:016X}: v{have}, newest v{latest}"))
+                .collect();
+            theme::pill(ui, format!("{} DLC outdated", r.outdated_dlc.len()), p.warn)
+                .on_hover_text(format!("{}\n{updated}", list.join("\n")));
+        }
+    });
 }
 
 /// One row of the contents table with fixed-width columns.
@@ -1393,6 +1607,9 @@ impl eframe::App for App {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        if self.debug.screenshot.is_some() {
+            return; // debug runs mustn't change the user's saved settings
+        }
         eframe::set_value(storage, eframe::APP_KEY, &self.settings);
     }
 }

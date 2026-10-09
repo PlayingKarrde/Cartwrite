@@ -50,6 +50,18 @@ pub fn slice(data: &[u8], offset: u64, len: u64) -> Option<&[u8]> {
     data.get(start..end)
 }
 
+/// How long ago `t` was, e.g. "just now", "5 minutes ago", "3 hours ago", "2 days ago".
+pub fn format_age(t: std::time::SystemTime) -> String {
+    let secs = t.elapsed().map(|d| d.as_secs()).unwrap_or(0);
+    let plural = |n: u64, unit: &str| format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" });
+    match secs {
+        0..=89 => "just now".into(),
+        90..=5399 => plural((secs + 30) / 60, "minute"),
+        5400..=129_599 => plural((secs + 1800) / 3600, "hour"),
+        _ => plural((secs + 43_200) / 86_400, "day"),
+    }
+}
+
 pub fn format_size(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut v = bytes as f64;

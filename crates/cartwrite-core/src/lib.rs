@@ -15,6 +15,7 @@ pub mod romfs;
 pub mod rsv;
 pub mod scan;
 pub mod ticket;
+pub mod titledb;
 pub mod util;
 
 pub use error::{Error, Result};

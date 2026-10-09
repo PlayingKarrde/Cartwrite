@@ -21,6 +21,8 @@ it.
 - Can lower the required system version so the game doesn't ask for a system update it doesn't
   need (see [Options](#options)).
 - Can split output into 4 GB parts for FAT32 SD cards.
+- Optional check for newer updates and missing DLC against a title database you choose. Off by
+  default.
 - Dark and light themes.
 
 ## Getting started
@@ -79,6 +81,40 @@ required firmware and source file. Untick a row to leave it out of the build.
 
 ![Contents list](docs/screenshots/contents.png)
 
+### Check for newer updates and missing DLC
+
+This is off by default. Turn on **Check for newer updates and missing DLC** in Settings and
+each game card shows how your files compare with a community title database:
+
+- **Up to date**: you have the newest update and every DLC the database lists.
+- **Newer update available**: the database lists a later update than the one you have.
+- **N DLC missing**: DLC the database lists that none of your files contain. Hover to see
+  their title IDs.
+- **N DLC outdated**: you have the DLC, but an older version of it.
+- **Not in title database**: the database doesn't list this game.
+
+![Update check result](docs/screenshots/update-check.png)
+
+How it works:
+
+- The database is a single text file listing the newest version of every title. By default it
+  comes from [blawar/titledb](https://github.com/blawar/titledb) (`versions.txt`, about 3 MB).
+- It's downloaded in the background and cached, so it never holds up the app. The cached copy
+  is used straight away and refreshed once it is more than a day old, or when you click
+  **Refresh now**.
+- If a download fails, Cartwrite says why (for example, that you're offline) and keeps using
+  the last copy it had.
+- You can change the source to any URL or to a local file, for example a copy you keep
+  yourself or a different mirror. The file needs to be in titledb's `versions.txt` format: one
+  `id|rightsId|version` line per title. titledb's `versions.json` also works, but it only
+  covers updates, not DLC.
+- Nothing about your games is sent anywhere. The database is downloaded and compared on your
+  computer.
+
+![Update check settings](docs/screenshots/update-check-settings.png)
+
+The check only tells you something newer exists. Cartwrite doesn't download game content.
+
 ### Output file names
 
 Files are named like this:
@@ -105,6 +141,8 @@ Settings are in the gear menu. The most used ones are also at the bottom of the 
 | Split for FAT32 | Off | FAT32 SD cards can't hold files over 4 GB. With this on, large XCIs are written as `.xc0`, `.xc1` and so on. |
 | Keep update delta fragments | Off | Delta fragments are only used by the eShop to patch an installed game. They are useless in an XCI, so they're left out by default. |
 | Delete the old XCI after rebuilding it | Off | See [Update an XCI you already have](#update-an-xci-you-already-have). |
+| Check for newer updates and missing DLC | Off | See [Check for newer updates and missing DLC](#check-for-newer-updates-and-missing-dlc). |
+| Title database source | blawar/titledb `versions.txt` | Where the update check gets its data. Any URL or a local file. |
 | Theme | Dark, NX style | Dark, light or follow the system. There is also a violet colour style. |
 
 ## Command line
@@ -113,10 +151,14 @@ Settings are in the gear menu. The most used ones are also at the bottom of the 
 
 ```
 cartwrite-cli info  <files or folders...>
+cartwrite-cli check [--titledb URL|FILE] [--refresh] <files or folders...>
 cartwrite-cli build [-o DIR] [--no-rsv] [--fat32] [--deltas] [--keys FILE] <files or folders...>
 ```
 
 - `info` lists every game found, with each title's version, size, required firmware and source.
+- `check` does the same and also reports newer updates and missing DLC. `--titledb` sets the
+  database source (default: blawar/titledb `versions.txt`) and `--refresh` downloads it again
+  even if the cached copy is recent.
 - `build` writes one XCI per game into `DIR` (default `output`).
 - `--no-rsv` turns off lowering the required firmware.
 - `--fat32` splits large files into 4 GB parts.
