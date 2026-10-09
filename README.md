@@ -27,8 +27,9 @@ it.
 
 ### 1. Get the app
 
-There are no prebuilt releases yet, so build it from source (see
-[Building from source](#building-from-source)). It takes a couple of minutes.
+Download the latest zip from the [Releases](../../releases) page, extract it anywhere and run
+`cartwrite.exe`. Windows builds are provided; on Linux and macOS, build it from source (see
+[Building from source](#building-from-source)).
 
 ### 2. Add your keys
 
