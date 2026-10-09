@@ -105,7 +105,7 @@ Settings are in the gear menu. The most used ones are also at the bottom of the 
 | Split for FAT32 | Off | FAT32 SD cards can't hold files over 4 GB. With this on, large XCIs are written as `.xc0`, `.xc1` and so on. |
 | Keep update delta fragments | Off | Delta fragments are only used by the eShop to patch an installed game. They are useless in an XCI, so they're left out by default. |
 | Delete the old XCI after rebuilding it | Off | See [Update an XCI you already have](#update-an-xci-you-already-have). |
-| Theme | Dark, Switch 2 style | Dark, light or follow the system. There is also a violet colour style. |
+| Theme | Dark, NX style | Dark, light or follow the system. There is also a violet colour style. |
 
 ## Command line
 

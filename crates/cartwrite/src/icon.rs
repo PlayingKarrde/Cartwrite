@@ -1,7 +1,7 @@
 //! The Cartwrite icon, drawn procedurally so the window icon, the in-app logo and the
 //! embedded .exe icon are always identical. Dependency-free so `build.rs` can include it.
 
-/// Nintendo-style red used for the default icon.
+/// Red used for the default icon.
 pub const ICON_RED: [u8; 3] = [0xE6, 0x00, 0x12];
 
 /// Renders the icon as straight-alpha RGBA, `size`×`size`, on an `accent` background.

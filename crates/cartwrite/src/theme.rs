@@ -29,9 +29,11 @@ impl ThemeChoice {
 /// Colour scheme family; each has a dark and a light variant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum ThemeStyle {
-    /// Nintendo red on charcoal / white with Joy-Con cyan and coral accents, pill buttons.
+    /// Red on charcoal / white with cyan and coral accents, pill buttons.
+    /// (`Switch` was its saved name before it was renamed.)
     #[default]
-    Switch,
+    #[serde(alias = "Switch")]
+    Nx,
     /// The original violet look.
     Violet,
 }
@@ -41,7 +43,7 @@ static STYLE: AtomicU8 = AtomicU8::new(0);
 pub fn style() -> ThemeStyle {
     match STYLE.load(Ordering::Relaxed) {
         1 => ThemeStyle::Violet,
-        _ => ThemeStyle::Switch,
+        _ => ThemeStyle::Nx,
     }
 }
 
@@ -130,9 +132,8 @@ pub const VIOLET_LIGHT: Palette = Palette {
     widget_radius: 8,
 };
 
-/// Inspired by the Nintendo Switch 2 site and hardware: matte charcoal, Nintendo red,
-/// Joy-Con cyan and coral highlights.
-pub const SWITCH_DARK: Palette = Palette {
+/// The "NX" style: matte charcoal, a bold red accent, and cyan and coral highlights.
+pub const NX_DARK: Palette = Palette {
     bg: hex(0x151515),
     panel: hex(0x1C1C1C),
     card: hex(0x242424),
@@ -158,7 +159,7 @@ pub const SWITCH_DARK: Palette = Palette {
     widget_radius: 14,
 };
 
-pub const SWITCH_LIGHT: Palette = Palette {
+pub const NX_LIGHT: Palette = Palette {
     bg: hex(0xF0F0F0),
     panel: hex(0xFFFFFF),
     card: hex(0xFFFFFF),
@@ -186,8 +187,8 @@ pub const SWITCH_LIGHT: Palette = Palette {
 
 pub fn palette_for(style: ThemeStyle, dark: bool) -> Palette {
     match (style, dark) {
-        (ThemeStyle::Switch, true) => SWITCH_DARK,
-        (ThemeStyle::Switch, false) => SWITCH_LIGHT,
+        (ThemeStyle::Nx, true) => NX_DARK,
+        (ThemeStyle::Nx, false) => NX_LIGHT,
         (ThemeStyle::Violet, true) => VIOLET_DARK,
         (ThemeStyle::Violet, false) => VIOLET_LIGHT,
     }

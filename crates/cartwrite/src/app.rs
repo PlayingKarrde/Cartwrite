@@ -43,7 +43,7 @@ impl Default for Settings {
             delete_source_xci: false,
             last_dir: None,
             theme: ThemeChoice::Dark,
-            style: ThemeStyle::Switch,
+            style: ThemeStyle::Nx,
         }
     }
 }
@@ -843,8 +843,7 @@ impl App {
                 }
                 ui.add_space(4.0);
                 let mut style = self.settings.style;
-                if theme::segmented(ui, &mut style, &[(ThemeStyle::Switch, "Switch 2"), (ThemeStyle::Violet, "Violet")])
-                {
+                if theme::segmented(ui, &mut style, &[(ThemeStyle::Nx, "NX"), (ThemeStyle::Violet, "Violet")]) {
                     self.settings.style = style;
                     theme::apply_style(ui.ctx(), style);
                 }
