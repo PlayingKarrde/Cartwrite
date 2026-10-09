@@ -1,0 +1,1421 @@
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::Arc;
+use std::time::Instant;
+
+use cartwrite_core::build::{BuildOptions, Progress};
+use cartwrite_core::container::ContainerKind;
+use cartwrite_core::plan::{group, output_stem, Game};
+use cartwrite_core::rsv::format_rsv;
+use cartwrite_core::scan::{Title, TitleKind, EXTENSIONS};
+use cartwrite_core::util::format_size;
+use cartwrite_core::Keys;
+use eframe::egui::{self, Color32, RichText};
+
+use crate::theme::{self, ThemeChoice, ThemeStyle};
+use crate::worker::{spawn_build, spawn_scan, BuildJob, BuildMsg, ScanMsg};
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct Settings {
+    keys_path: Option<PathBuf>,
+    /// `None` = write next to the first source file.
+    output_dir: Option<PathBuf>,
+    patch_rsv: bool,
+    split_fat32: bool,
+    include_deltas: bool,
+    delete_source_xci: bool,
+    last_dir: Option<PathBuf>,
+    theme: ThemeChoice,
+    style: ThemeStyle,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            keys_path: None,
+            output_dir: None,
+            patch_rsv: true,
+            split_fat32: false,
+            include_deltas: false,
+            delete_source_xci: false,
+            last_dir: None,
+            theme: ThemeChoice::Dark,
+            style: ThemeStyle::Switch,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq)]
+enum Status {
+    Ready,
+    Queued,
+    Building { done: u64, total: u64 },
+    Done(Vec<PathBuf>),
+    Failed(String),
+}
+
+struct GameView {
+    game: Game,
+    selected: bool,
+    /// Title IDs the user unticked.
+    excluded: HashSet<u64>,
+    status: Status,
+    icon: Option<egui::load::Bytes>,
+}
+
+impl GameView {
+    fn chosen(&self) -> Vec<&Title> {
+        self.game.titles.iter().filter(|t| !self.excluded.contains(&t.title_id)).collect()
+    }
+
+    fn file_stem(&self) -> String {
+        output_stem(&self.game.name, self.game.application_id, &self.chosen())
+    }
+}
+
+struct Job {
+    rx: Receiver<BuildMsg>,
+    cancel: Arc<AtomicBool>,
+    started: Instant,
+    current: Option<u64>,
+    bytes_before: u64,
+    bytes_total: u64,
+}
+
+pub struct App {
+    settings: Settings,
+    keys: Option<Arc<Keys>>,
+    keys_error: Option<String>,
+    inputs: Vec<PathBuf>,
+    titles: Vec<Title>,
+    scan_errors: Vec<(PathBuf, String)>,
+    games: Vec<GameView>,
+    scan_rx: Option<Receiver<ScanMsg>>,
+    job: Option<Job>,
+    log: Vec<(Instant, String, bool)>,
+    show_settings: bool,
+    show_log: bool,
+    pending_rescan: bool,
+    scanned: HashSet<PathBuf>,
+    logo: Option<(Color32, egui::TextureHandle)>,
+    debug: DebugHooks,
+}
+
+/// Developer aids driven by environment variables (used to screenshot the UI headlessly).
+#[derive(Default)]
+struct DebugHooks {
+    /// `CARTWRITE_SCREENSHOT=out.png`: save a screenshot after ~2 s and exit.
+    screenshot: Option<PathBuf>,
+    /// `CARTWRITE_DEBUG_BUILD`: start "Build all" shortly after launch.
+    auto_build: bool,
+    /// `CARTWRITE_DEBUG_SETTINGS`: open the settings dialog on launch.
+    open_settings: bool,
+    // `CARTWRITE_DEBUG_THEME=light` is applied in `App::new` without touching saved settings.
+}
+
+impl DebugHooks {
+    fn from_env() -> Self {
+        Self {
+            screenshot: std::env::var_os("CARTWRITE_SCREENSHOT").map(PathBuf::from),
+            auto_build: std::env::var_os("CARTWRITE_DEBUG_BUILD").is_some(),
+            open_settings: std::env::var_os("CARTWRITE_DEBUG_SETTINGS").is_some(),
+        }
+    }
+}
+
+impl App {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        egui_extras::install_image_loaders(&cc.egui_ctx);
+        let settings: Settings = cc.storage.and_then(|s| eframe::get_value(s, eframe::APP_KEY)).unwrap_or_default();
+        theme::install(&cc.egui_ctx, settings.style, settings.theme);
+        if std::env::var("CARTWRITE_DEBUG_THEME").as_deref() == Ok("light") {
+            cc.egui_ctx.set_theme(egui::ThemePreference::Light);
+        }
+        let mut app = Self {
+            settings,
+            keys: None,
+            keys_error: None,
+            inputs: Vec::new(),
+            titles: Vec::new(),
+            scan_errors: Vec::new(),
+            games: Vec::new(),
+            scan_rx: None,
+            job: None,
+            log: Vec::new(),
+            show_settings: false,
+            show_log: false,
+            pending_rescan: false,
+            scanned: HashSet::new(),
+            logo: None,
+            debug: DebugHooks::from_env(),
+        };
+        app.show_settings = app.debug.open_settings;
+        app.load_keys();
+        // Files passed on the command line / dropped onto the exe.
+        let args: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
+        if !args.is_empty() {
+            app.add_paths(&cc.egui_ctx, args);
+        }
+        app
+    }
+
+    fn load_keys(&mut self) {
+        let path = self.settings.keys_path.clone().filter(|p| p.is_file()).or_else(Keys::find_default);
+        match path {
+            None => {
+                self.keys = None;
+                self.keys_error = Some("prod.keys not found".into());
+            }
+            Some(p) => match Keys::load(&p) {
+                Ok(k) => {
+                    self.keys = Some(Arc::new(k));
+                    self.keys_error = None;
+                }
+                Err(e) => {
+                    self.keys = None;
+                    self.keys_error = Some(format!("{}: {e}", p.display()));
+                }
+            },
+        }
+    }
+
+    fn log(&mut self, msg: impl Into<String>, error: bool) {
+        self.log.push((Instant::now(), msg.into(), error));
+        if error {
+            self.show_log = true;
+        }
+    }
+
+    fn busy(&self) -> bool {
+        self.scan_rx.is_some() || self.job.is_some()
+    }
+
+    fn add_paths(&mut self, ctx: &egui::Context, paths: Vec<PathBuf>) {
+        let new: Vec<PathBuf> = paths
+            .into_iter()
+            .map(|p| std::path::absolute(&p).unwrap_or(p))
+            .filter(|p| !self.inputs.contains(p))
+            .collect();
+        if new.is_empty() {
+            return;
+        }
+        self.inputs.extend(new.iter().cloned());
+        if let Some(keys) = self.keys.clone() {
+            if self.scan_rx.is_none() {
+                self.scan_rx = Some(spawn_scan(ctx.clone(), keys, new));
+            } else {
+                // A scan is running: queue by rescanning everything when it ends.
+                self.pending_rescan = true;
+            }
+        }
+    }
+
+    fn rescan_all(&mut self, ctx: &egui::Context) {
+        self.titles.clear();
+        self.scanned.clear();
+        self.scan_errors.clear();
+        self.regroup();
+        if let Some(keys) = self.keys.clone() {
+            self.scan_rx = Some(spawn_scan(ctx.clone(), keys, self.inputs.clone()));
+        }
+    }
+
+    fn clear(&mut self) {
+        self.inputs.clear();
+        self.scanned.clear();
+        self.titles.clear();
+        self.scan_errors.clear();
+        self.games.clear();
+    }
+
+    /// Rebuilds the game list, keeping per-game UI state.
+    fn regroup(&mut self) {
+        let old: HashMap<u64, GameView> = self.games.drain(..).map(|g| (g.game.application_id, g)).collect();
+        let mut old = old;
+        self.games = group(self.titles.clone())
+            .into_iter()
+            .map(|game| {
+                let icon = game.icon.as_ref().map(|v| egui::load::Bytes::from(v.as_slice().to_vec()));
+                match old.remove(&game.application_id) {
+                    Some(prev) => GameView {
+                        game,
+                        selected: prev.selected,
+                        excluded: prev.excluded,
+                        status: if matches!(prev.status, Status::Done(_) | Status::Failed(_)) {
+                            Status::Ready
+                        } else {
+                            prev.status
+                        },
+                        icon,
+                    },
+                    None => GameView { game, selected: true, excluded: HashSet::new(), status: Status::Ready, icon },
+                }
+            })
+            .collect();
+        self.games.sort_by_key(|g| g.game.name.to_lowercase());
+    }
+
+    fn poll(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = &self.scan_rx {
+            let mut changed = false;
+            let mut done = false;
+            let mut msgs = Vec::new();
+            loop {
+                match rx.try_recv() {
+                    Ok(ScanMsg::File(p, r)) => msgs.push((p, r)),
+                    Ok(ScanMsg::Done) | Err(TryRecvError::Disconnected) => {
+                        done = true;
+                        break;
+                    }
+                    Err(TryRecvError::Empty) => break,
+                }
+            }
+            for (p, r) in msgs {
+                if !self.scanned.insert(p.clone()) {
+                    continue;
+                }
+                changed = true;
+                match r {
+                    Ok(t) => self.titles.extend(t),
+                    Err(e) => {
+                        let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                        self.log(format!("✖ {name}: {e}"), true);
+                        self.scan_errors.push((p, e));
+                    }
+                }
+            }
+            if changed {
+                self.regroup();
+            }
+            if done {
+                self.scan_rx = None;
+                if std::mem::take(&mut self.pending_rescan) {
+                    self.rescan_all(ctx);
+                }
+            }
+        }
+
+        let Some(job) = &mut self.job else { return };
+        let mut msgs = Vec::new();
+        loop {
+            match job.rx.try_recv() {
+                Ok(m) => msgs.push(m),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    msgs.push(BuildMsg::AllDone);
+                    break;
+                }
+            }
+        }
+        for m in msgs {
+            match m {
+                BuildMsg::Started(id) => {
+                    if let Some(job) = &mut self.job {
+                        job.current = Some(id);
+                    }
+                    let name = self.game_name(id);
+                    self.log(format!("Building {name}"), false);
+                    self.set_status(id, Status::Building { done: 0, total: 1 });
+                }
+                BuildMsg::Progress(id, Progress::Bytes { done, total }) => {
+                    self.set_status(id, Status::Building { done, total })
+                }
+                BuildMsg::Progress(_, Progress::Log(msg)) => self.log(msg, false),
+                BuildMsg::Finished(id, r) => {
+                    if let Some(job) = &mut self.job {
+                        if let Some(g) = self.games.iter().find(|g| g.game.application_id == id) {
+                            if let Status::Building { total, .. } = g.status {
+                                job.bytes_before += total;
+                            }
+                        }
+                    }
+                    match r {
+                        Ok(paths) => {
+                            for p in &paths {
+                                self.log(format!("✔ Wrote {}", p.display()), false);
+                            }
+                            self.set_status(id, Status::Done(paths));
+                        }
+                        Err(e) => {
+                            let name = self.game_name(id);
+                            self.log(format!("✖ {name}: {e}"), true);
+                            self.set_status(id, Status::Failed(e));
+                        }
+                    }
+                }
+                BuildMsg::Cancelled(id) => {
+                    let name = self.game_name(id);
+                    self.log(format!("Cancelled {name}"), false);
+                    self.set_status(id, Status::Ready);
+                }
+                BuildMsg::AllDone => {
+                    for g in &mut self.games {
+                        if g.status == Status::Queued {
+                            g.status = Status::Ready;
+                        }
+                    }
+                    self.job = None;
+                    return;
+                }
+            }
+        }
+    }
+
+    fn game_name(&self, id: u64) -> String {
+        self.games.iter().find(|g| g.game.application_id == id).map(|g| g.game.name.clone()).unwrap_or_default()
+    }
+
+    fn set_status(&mut self, id: u64, s: Status) {
+        if let Some(g) = self.games.iter_mut().find(|g| g.game.application_id == id) {
+            g.status = s;
+        }
+    }
+
+    fn output_dir_for(&self, g: &GameView) -> PathBuf {
+        if let Some(d) = &self.settings.output_dir {
+            return d.clone();
+        }
+        g.chosen().first().and_then(|t| t.source.parent().map(Path::to_path_buf)).unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    fn start_build(&mut self, ctx: &egui::Context, only: Option<u64>) {
+        let Some(keys) = self.keys.clone() else { return };
+        let mut jobs = Vec::new();
+        for g in &self.games {
+            let wanted = match only {
+                Some(id) => g.game.application_id == id,
+                None => g.selected,
+            };
+            if !wanted || g.chosen().is_empty() {
+                continue;
+            }
+            let output = self.output_dir_for(g).join(format!("{}.xci", g.file_stem()));
+            let delete_after = if self.settings.delete_source_xci { self.deletable_sources(g) } else { Vec::new() };
+            jobs.push(BuildJob {
+                application_id: g.game.application_id,
+                titles: g.chosen().into_iter().cloned().collect(),
+                output,
+                delete_after,
+            });
+        }
+        if jobs.is_empty() {
+            return;
+        }
+        let ids: HashSet<u64> = jobs.iter().map(|j| j.application_id).collect();
+        let bytes_total = self
+            .games
+            .iter()
+            .filter(|g| ids.contains(&g.game.application_id))
+            .map(|g| g.chosen().iter().map(|t| t.size(self.settings.include_deltas)).sum::<u64>())
+            .sum();
+        for g in &mut self.games {
+            if ids.contains(&g.game.application_id) {
+                g.status = Status::Queued;
+            }
+        }
+        let opts = BuildOptions {
+            patch_rsv: self.settings.patch_rsv,
+            include_deltas: self.settings.include_deltas,
+            split_fat32: self.settings.split_fat32,
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let rx = spawn_build(ctx.clone(), keys, jobs, opts, cancel.clone());
+        self.job = Some(Job { rx, cancel, started: Instant::now(), current: None, bytes_before: 0, bytes_total });
+    }
+
+    /// Source XCIs that are safe to delete after rebuilding `g`: every title they hold must
+    /// end up in the new XCI (or be an older version of one that does), they must not hold
+    /// other games, and nothing in them may have been skipped while reading.
+    fn deletable_sources(&self, g: &GameView) -> Vec<PathBuf> {
+        let chosen = g.chosen();
+        let carried_over = |o: &Title| chosen.iter().any(|c| c.title_id == o.title_id && c.version >= o.version);
+        let mut out: Vec<PathBuf> = Vec::new();
+        let srcs = g.game.titles.iter().chain(&g.game.superseded).filter(|t| t.source_kind == ContainerKind::Xci);
+        for t in srcs {
+            let p = t.source.as_ref();
+            if out.contains(p) {
+                continue;
+            }
+            let safe = self
+                .titles
+                .iter()
+                .filter(|o| o.source.as_ref() == p)
+                .all(|o| o.application_id == g.game.application_id && o.source_complete && carried_over(o));
+            if safe {
+                out.push(p.clone());
+            }
+        }
+        out
+    }
+
+    // ---------------------------------------------------------------- UI
+
+    fn header(&mut self, ui: &mut egui::Ui) {
+        let p = theme::palette(ui);
+        let logo = self.logo_texture(ui.ctx(), p.accent);
+        ui.horizontal(|ui| {
+            ui.add(egui::Image::new((logo.id(), egui::vec2(34.0, 34.0))));
+            ui.add_space(2.0);
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.label(RichText::new("Cartwrite").font(theme::semibold(17.0)).color(p.text));
+                ui.label(RichText::new("Base game + update + DLC → one XCI").size(12.0).color(p.text_dim));
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if theme::icon_button(ui, true, "⚙", "Settings").clicked() {
+                    self.show_settings = true;
+                }
+                let (icon, tip, next) = match self.settings.theme {
+                    ThemeChoice::Dark => ("☀", "Switch to light mode", ThemeChoice::Light),
+                    ThemeChoice::Light => ("🌙", "Switch to dark mode", ThemeChoice::Dark),
+                    ThemeChoice::System => ("◐", "Following system theme. Click for dark mode.", ThemeChoice::Dark),
+                };
+                if theme::icon_button(ui, true, icon, tip).clicked() {
+                    self.settings.theme = next;
+                    ui.ctx().set_theme(next.preference());
+                }
+                ui.add_space(6.0);
+                match self.keys.clone() {
+                    Some(k) => {
+                        let mk = k.max_master_key().unwrap_or(0);
+                        status_pill(ui, p.ok, &format!("Keys ready · {mk:#04x}"))
+                            .on_hover_text(format!("{}\nNewest master key: {mk:#04x}", k.path.display()));
+                    }
+                    None => {
+                        let r = status_pill(ui, p.err, "prod.keys missing. Click to locate.")
+                            .interact(egui::Sense::click())
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .on_hover_text(self.keys_error.clone().unwrap_or_default());
+                        if r.clicked() {
+                            self.pick_keys(ui.ctx());
+                        }
+                    }
+                }
+            });
+        });
+    }
+
+    /// The app icon rendered in the current accent colour (cached per colour).
+    fn logo_texture(&mut self, ctx: &egui::Context, accent: Color32) -> egui::TextureHandle {
+        if let Some((c, tex)) = &self.logo {
+            if *c == accent {
+                return tex.clone();
+            }
+        }
+        let rgba = crate::icon::render(128, [accent.r(), accent.g(), accent.b()]);
+        let img = egui::ColorImage::from_rgba_unmultiplied([128, 128], &rgba);
+        let tex = ctx.load_texture("logo", img, egui::TextureOptions::LINEAR);
+        self.logo = Some((accent, tex.clone()));
+        tex
+    }
+
+    fn pick_keys(&mut self, ctx: &egui::Context) {
+        if let Some(p) = rfd::FileDialog::new().add_filter("Keys", &["keys", "txt"]).pick_file() {
+            self.settings.keys_path = Some(p);
+            self.load_keys();
+            if self.keys.is_some() {
+                self.rescan_all(ctx);
+            }
+        }
+    }
+
+    fn add_files_dialog(&mut self, ctx: &egui::Context) {
+        let mut d = rfd::FileDialog::new().add_filter("Switch content", &EXTENSIONS);
+        if let Some(dir) = &self.settings.last_dir {
+            d = d.set_directory(dir);
+        }
+        if let Some(files) = d.pick_files() {
+            self.settings.last_dir = files.first().and_then(|f| f.parent().map(Path::to_path_buf));
+            self.add_paths(ctx, files);
+        }
+    }
+
+    fn add_folder_dialog(&mut self, ctx: &egui::Context) {
+        let mut d = rfd::FileDialog::new();
+        if let Some(dir) = &self.settings.last_dir {
+            d = d.set_directory(dir);
+        }
+        if let Some(dir) = d.pick_folder() {
+            self.settings.last_dir = Some(dir.clone());
+            self.add_paths(ctx, vec![dir]);
+        }
+    }
+
+    fn bottom_bar(&mut self, ui: &mut egui::Ui) {
+        let p = theme::palette(ui);
+        if let Some(job) = &self.job {
+            let current = job.current.and_then(|id| self.games.iter().find(|g| g.game.application_id == id));
+            let cur_done = match current.map(|g| &g.status) {
+                Some(Status::Building { done, .. }) => *done,
+                _ => 0,
+            };
+            let total = job.bytes_total.max(1);
+            let done = (job.bytes_before + cur_done).min(total);
+            let secs = job.started.elapsed().as_secs_f64().max(0.001);
+            let speed = done as f64 / secs;
+            let eta = if speed > 0.0 { total.saturating_sub(done) as f64 / speed } else { 0.0 };
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(RichText::new("Building").color(p.text_dim));
+                ui.label(
+                    RichText::new(current.map(|g| g.game.name.as_str()).unwrap_or("…")).font(theme::semibold(14.0)),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::ghost_button(ui, true, "Cancel").clicked() {
+                        job.cancel.store(true, Ordering::Relaxed);
+                    }
+                    ui.label(
+                        RichText::new(format!(
+                            "{} of {}  ·  {}/s  ·  {} left",
+                            format_size(done),
+                            format_size(total),
+                            format_size(speed as u64),
+                            fmt_secs(eta)
+                        ))
+                        .color(p.text_dim),
+                    );
+                });
+            });
+            let w = ui.available_width();
+            theme::progress_bar(ui, egui::Id::new("overall"), done as f32 / total as f32, w);
+            ui.add_space(10.0);
+        }
+
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Output").color(p.text_dim));
+            let label = match &self.settings.output_dir {
+                Some(d) => short_path(d, 42),
+                None => "Same folder as source".into(),
+            };
+            let hover = match &self.settings.output_dir {
+                Some(d) => d.display().to_string(),
+                None => "Each XCI is written next to its source files. Click to pick a folder.".into(),
+            };
+            if theme::secondary_button(ui, true, format!("{label}  ⏷")).on_hover_text(hover).clicked() {
+                if let Some(d) = rfd::FileDialog::new().pick_folder() {
+                    self.settings.output_dir = Some(d);
+                }
+            }
+            if self.settings.output_dir.is_some() && theme::icon_button(ui, true, "✕", "Use source folder").clicked() {
+                self.settings.output_dir = None;
+            }
+            ui.add_space(14.0);
+            theme::toggle(
+                ui,
+                &mut self.settings.patch_rsv,
+                "Lower required firmware",
+                "Patch RequiredSystemVersion down to the first firmware that can decrypt the game,\nso consoles on older firmware aren't asked to update.",
+            );
+            ui.add_space(6.0);
+            theme::toggle(ui, &mut self.settings.split_fat32, "Split for FAT32", "Split files larger than 4 GB into .xc0, .xc1, … parts");
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let n = self.games.iter().filter(|g| g.selected && !g.chosen().is_empty()).count();
+                let can = self.keys.is_some() && !self.busy() && n > 0;
+                let text = match n {
+                    0 => "Build".to_string(),
+                    1 => "Build 1 XCI".to_string(),
+                    n => format!("Build {n} XCIs"),
+                };
+                if theme::primary_button(ui, can, &format!("   {text}   ")).clicked() {
+                    self.start_build(ui.ctx(), None);
+                }
+                let errors = self.log.iter().filter(|l| l.2).count();
+                let icon = if errors > 0 { format!("☰ {errors}") } else { "☰".into() };
+                let tip = if self.show_log { "Hide activity log" } else { "Show activity log" };
+                if theme::icon_button(ui, true, &icon, tip).clicked() {
+                    self.show_log = !self.show_log;
+                }
+            });
+        });
+    }
+
+    fn log_panel(&mut self, ui: &mut egui::Ui) {
+        let p = theme::palette(ui);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Activity").font(theme::semibold(13.0)));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if theme::ghost_button(ui, true, "Clear").clicked() {
+                    self.log.clear();
+                }
+            });
+        });
+        egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 3.0;
+            if self.log.is_empty() {
+                ui.label(RichText::new("Nothing yet.").color(p.text_faint));
+            }
+            for (_, msg, err) in &self.log {
+                let c = if *err { p.err } else { p.text_dim };
+                ui.label(RichText::new(msg).monospace().color(c));
+            }
+        });
+    }
+
+    fn drop_zone(&mut self, ui: &mut egui::Ui, hovering: bool) {
+        let p = theme::palette(ui);
+        let avail = ui.available_rect_before_wrap();
+        let size = egui::vec2(avail.width().min(640.0), 320.0);
+        let rect = egui::Rect::from_center_size(avail.center() - egui::vec2(0.0, 24.0), size);
+        let zone = ui.allocate_rect(rect, egui::Sense::click());
+        let hot = hovering || zone.hovered();
+        let t = ui.ctx().animate_bool_with_time(egui::Id::new("dz-hot"), hot, 0.15);
+        let painter = ui.painter();
+        painter.rect_filled(rect, 20.0, theme::lerp_color(p.card, p.accent.gamma_multiply(0.10), t));
+        theme::dashed_rect(
+            painter,
+            rect.shrink(1.0),
+            egui::Stroke::new(1.5, theme::lerp_color(p.border_strong, p.accent, t)),
+        );
+        if zone.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+            self.add_files_dialog(ui.ctx());
+        }
+
+        let inner = rect.shrink2(egui::vec2(40.0, 34.0));
+        ui.scope_builder(egui::UiBuilder::new().max_rect(inner).layout(egui::Layout::top_down(egui::Align::Center)), |ui| {
+            let (r, _) = ui.allocate_exact_size(egui::vec2(64.0, 64.0), egui::Sense::hover());
+            ui.painter().circle_filled(r.center(), 32.0, p.accent.gamma_multiply(0.16));
+            ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, "⬇", egui::FontId::proportional(28.0), p.accent);
+            ui.add_space(6.0);
+            ui.label(RichText::new("Drop your games here").font(theme::semibold(22.0)).color(p.text));
+            ui.label(
+                RichText::new("Add a game with its update and DLC, or an XCI you built earlier plus a newer update, and get one XCI back.")
+                    .color(p.text_dim),
+            );
+            ui.add_space(12.0);
+            let bw = 136.0;
+            ui.allocate_ui_with_layout(egui::vec2(bw * 2.0 + 10.0, 36.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                if theme::primary_button_sized(ui, true, "Add files", egui::vec2(bw, 36.0)).clicked() {
+                    self.add_files_dialog(ui.ctx());
+                }
+                if ui.add_sized([bw, 36.0], egui::Button::new("Add folder").corner_radius(p.button_radius)).clicked() {
+                    self.add_folder_dialog(ui.ctx());
+                }
+            });
+            ui.add_space(10.0);
+            ui.label(RichText::new("NSP  ·  NSZ  ·  XCI  ·  XCZ").size(12.0).color(p.text_faint));
+        });
+
+        if self.keys.is_none() {
+            let below = egui::Rect::from_min_size(
+                egui::pos2(rect.left(), rect.bottom() + 16.0),
+                egui::vec2(rect.width(), 40.0),
+            );
+            ui.scope_builder(egui::UiBuilder::new().max_rect(below).layout(egui::Layout::top_down(egui::Align::Center)), |ui| {
+                ui.label(
+                    RichText::new("prod.keys is required. Put it in %USERPROFILE%\\.switch\\, next to the app, or click the red badge above.")
+                        .color(p.warn),
+                );
+            });
+        }
+        if !self.scan_errors.is_empty() {
+            let top = rect.bottom() + if self.keys.is_none() { 56.0 } else { 16.0 };
+            let area = egui::Rect::from_min_size(egui::pos2(rect.left(), top), egui::vec2(rect.width(), 140.0));
+            ui.scope_builder(
+                egui::UiBuilder::new().max_rect(area).layout(egui::Layout::top_down(egui::Align::Min)),
+                |ui| {
+                    ui.spacing_mut().item_spacing.y = 4.0;
+                    ui.label(
+                        RichText::new(format!("Couldn't read {} file(s)", self.scan_errors.len()))
+                            .font(theme::semibold(13.0))
+                            .color(p.err),
+                    );
+                    for (path, e) in self.scan_errors.iter().take(4) {
+                        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                        ui.add(
+                            egui::Label::new(RichText::new(format!("{name}: {e}")).size(12.5).color(p.text_dim))
+                                .truncate(),
+                        )
+                        .on_hover_text(format!("{}\n{e}", path.display()));
+                    }
+                    if self.scan_errors.len() > 4 {
+                        ui.label(
+                            RichText::new(format!("…and {} more (see the activity log)", self.scan_errors.len() - 4))
+                                .size(12.5)
+                                .color(p.text_faint),
+                        );
+                    }
+                },
+            );
+        }
+    }
+
+    fn game_list(&mut self, ui: &mut egui::Ui) {
+        let p = theme::palette(ui);
+        let busy = self.busy();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Games").font(theme::semibold(20.0)));
+            theme::pill(ui, self.games.len().to_string(), p.text_dim);
+            if self.scan_rx.is_some() {
+                ui.add_space(4.0);
+                ui.spinner();
+                ui.label(RichText::new("Reading files…").color(p.text_dim));
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if theme::ghost_button(ui, !busy, "Clear all").clicked() {
+                    self.clear();
+                }
+                if theme::secondary_button(ui, !busy, "Add folder").clicked() {
+                    self.add_folder_dialog(ui.ctx());
+                }
+                if theme::secondary_button(ui, !busy, "Add files").clicked() {
+                    self.add_files_dialog(ui.ctx());
+                }
+            });
+        });
+        ui.add_space(10.0);
+
+        let job_running = self.job.is_some();
+        let out_dir = self.settings.output_dir.clone();
+        let deltas = self.settings.include_deltas;
+        let mut build_one = None;
+        let mut remove = None;
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            for (i, g) in self.games.iter_mut().enumerate() {
+                let dir = match &out_dir {
+                    Some(d) => d.clone(),
+                    None => {
+                        g.chosen().first().and_then(|t| t.source.parent().map(Path::to_path_buf)).unwrap_or_default()
+                    }
+                };
+                match game_card(ui, g, job_running, &dir, deltas) {
+                    CardAction::None => {}
+                    CardAction::Build => build_one = Some(g.game.application_id),
+                    CardAction::Remove => remove = Some(i),
+                }
+                ui.add_space(10.0);
+            }
+            for (path, e) in &self.scan_errors {
+                let name = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+                ui.label(RichText::new(format!("✖ {name}: {e}")).color(p.err));
+            }
+        });
+        if let Some(id) = build_one {
+            self.start_build(ui.ctx(), Some(id));
+        }
+        if let Some(i) = remove {
+            let g = self.games.remove(i);
+            let srcs: HashSet<PathBuf> =
+                g.game.titles.iter().chain(&g.game.superseded).map(|t| t.source.as_ref().clone()).collect();
+            self.titles.retain(|t| t.application_id != g.game.application_id);
+            let still_used: HashSet<PathBuf> = self.titles.iter().map(|t| t.source.as_ref().clone()).collect();
+            self.inputs.retain(|p| !srcs.contains(p) || still_used.contains(p));
+            self.scanned.retain(|p| !srcs.contains(p) || still_used.contains(p));
+        }
+    }
+
+    fn settings_modal(&mut self, ctx: &egui::Context) {
+        let p = theme::palette_for(theme::style(), ctx.theme() == egui::Theme::Dark);
+        let mut close = false;
+        let mut reload = false;
+        let frame = egui::Frame::new()
+            .fill(p.panel)
+            .stroke(egui::Stroke::new(1.0, p.border))
+            .corner_radius(16)
+            .inner_margin(24)
+            .shadow(egui::epaint::Shadow { offset: [0, 16], blur: 48, spread: 0, color: p.shadow });
+        let max_h = (ctx.content_rect().height() - 120.0).max(200.0);
+        let modal = egui::Modal::new(egui::Id::new("settings")).frame(frame).show(ctx, |ui| {
+            ui.set_width(480.0);
+            egui::ScrollArea::vertical().max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Settings").font(theme::semibold(20.0)));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if theme::icon_button(ui, true, "✕", "Close").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+
+                section(ui, "APPEARANCE");
+                let mut choice = self.settings.theme;
+                if theme::segmented(
+                    ui,
+                    &mut choice,
+                    &[(ThemeChoice::Dark, "Dark"), (ThemeChoice::Light, "Light"), (ThemeChoice::System, "System")],
+                ) {
+                    self.settings.theme = choice;
+                    ui.ctx().set_theme(choice.preference());
+                }
+                ui.add_space(4.0);
+                let mut style = self.settings.style;
+                if theme::segmented(ui, &mut style, &[(ThemeStyle::Switch, "Switch 2"), (ThemeStyle::Violet, "Violet")])
+                {
+                    self.settings.style = style;
+                    theme::apply_style(ui.ctx(), style);
+                }
+
+                section(ui, "KEYS");
+                egui::Frame::new().fill(p.input).corner_radius(10).inner_margin(12).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| match &self.keys {
+                        Some(k) => {
+                            status_pill(ui, p.ok, "Loaded");
+                            ui.add(
+                                egui::Label::new(RichText::new(k.path.display().to_string()).color(p.text_dim))
+                                    .truncate(),
+                            );
+                        }
+                        None => {
+                            status_pill(ui, p.err, "Not loaded");
+                            ui.label(RichText::new(self.keys_error.clone().unwrap_or_default()).color(p.err));
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+                if theme::secondary_button(ui, self.job.is_none(), "Choose prod.keys…").clicked() {
+                    if let Some(path) = rfd::FileDialog::new().add_filter("Keys", &["keys", "txt"]).pick_file() {
+                        self.settings.keys_path = Some(path);
+                        reload = true;
+                    }
+                }
+                ui.label(
+                    RichText::new("Also found automatically next to the app, in .\\Keys\\ or %USERPROFILE%\\.switch\\")
+                        .size(12.0)
+                        .color(p.text_faint),
+                );
+
+                section(ui, "BUILDING");
+                setting_toggle(
+                    ui,
+                    &mut self.settings.patch_rsv,
+                    "Lower required firmware",
+                    "Patch RequiredSystemVersion to the first firmware that has the game's key.",
+                );
+                setting_toggle(
+                    ui,
+                    &mut self.settings.split_fat32,
+                    "Split for FAT32",
+                    "Write 4 GB parts (.xc0, .xc1, …) for FAT32 SD cards.",
+                );
+                setting_toggle(
+                    ui,
+                    &mut self.settings.include_deltas,
+                    "Keep update delta fragments",
+                    "Only used for eShop patching, so they are useless inside an XCI.",
+                );
+                setting_toggle(
+                    ui,
+                    &mut self.settings.delete_source_xci,
+                    "Delete the old XCI after rebuilding it",
+                    "When updating an existing XCI, remove the old file once the new one is written.",
+                );
+            });
+            ui.add_space(14.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if theme::primary_button(ui, true, "   Done   ").clicked() {
+                    close = true;
+                }
+            });
+        });
+        if close || modal.should_close() {
+            self.show_settings = false;
+        }
+        if reload {
+            self.load_keys();
+            if self.keys.is_some() {
+                self.rescan_all(ctx);
+            }
+        }
+    }
+}
+
+fn section(ui: &mut egui::Ui, title: &str) {
+    let p = theme::palette(ui);
+    ui.add_space(14.0);
+    ui.label(RichText::new(title).font(theme::semibold(11.5)).color(p.text_faint));
+    ui.add_space(2.0);
+}
+
+fn setting_toggle(ui: &mut egui::Ui, value: &mut bool, label: &str, hint: &str) {
+    let p = theme::palette(ui);
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        theme::toggle(ui, value, label, "");
+        ui.horizontal(|ui| {
+            ui.add_space(42.0);
+            ui.label(RichText::new(hint).size(12.0).color(p.text_dim));
+        });
+    });
+    ui.add_space(6.0);
+}
+
+fn status_pill(ui: &mut egui::Ui, color: Color32, text: &str) -> egui::Response {
+    let dark = ui.visuals().dark_mode;
+    // Own row so it sizes to its content inside right-aligned layouts; the dot is painted
+    // in the left padding so it stays on the left whatever the layout direction.
+    let resp = ui
+        .horizontal(|ui| {
+            egui::Frame::new()
+                .fill(color.gamma_multiply(if dark { 0.14 } else { 0.10 }))
+                .corner_radius(20)
+                .inner_margin(egui::Margin { left: 23, right: 11, top: 4, bottom: 4 })
+                .show(ui, |ui| {
+                    ui.label(RichText::new(text).font(theme::semibold(12.5)).color(color));
+                })
+                .response
+        })
+        .inner;
+    ui.painter().circle_filled(egui::pos2(resp.rect.left() + 13.0, resp.rect.center().y), 4.0, color);
+    resp
+}
+
+fn short_path(p: &Path, max: usize) -> String {
+    let s = p.display().to_string();
+    if s.chars().count() <= max {
+        return s;
+    }
+    let tail: String = s.chars().rev().take(max - 1).collect::<Vec<_>>().into_iter().rev().collect();
+    format!("…{tail}")
+}
+
+enum CardAction {
+    None,
+    Build,
+    Remove,
+}
+
+fn kind_color(p: &theme::Palette, kind: TitleKind) -> Color32 {
+    match kind {
+        TitleKind::Base => p.ok,
+        TitleKind::Update => p.info,
+        TitleKind::Dlc | TitleKind::DlcUpdate => p.dlc,
+    }
+}
+
+fn game_card(ui: &mut egui::Ui, g: &mut GameView, busy: bool, out_dir: &Path, deltas: bool) -> CardAction {
+    let p = theme::palette(ui);
+    let mut action = CardAction::None;
+    let id = egui::Id::new(("card", g.game.application_id));
+    let hovered = ui.ctx().data(|d| d.get_temp::<bool>(id)).unwrap_or(false);
+    let t = ui.ctx().animate_bool_with_time(id.with("h"), hovered, 0.12);
+    let selected_t = ui.ctx().animate_bool_with_time(id.with("s"), g.selected, 0.12);
+    let border = theme::lerp_color(p.border, p.border_strong, t);
+    let frame = egui::Frame::new()
+        .fill(p.card)
+        .stroke(egui::Stroke::new(1.0, border))
+        .corner_radius(14)
+        .inner_margin(16)
+        .shadow(egui::epaint::Shadow { offset: [0, 2], blur: 12, spread: 0, color: p.shadow.gamma_multiply(0.6) });
+
+    let resp = frame.show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            check_circle(ui, &mut g.selected, !busy, 22.0).on_hover_text("Include in “Build all”");
+            ui.add_space(2.0);
+            let size = egui::vec2(84.0, 84.0);
+            let alpha = 0.45 + 0.55 * selected_t;
+            match &g.icon {
+                Some(bytes) => {
+                    ui.add(
+                        egui::Image::from_bytes(
+                            format!("bytes://icon/{:016x}.jpg", g.game.application_id),
+                            bytes.clone(),
+                        )
+                        .fit_to_exact_size(size)
+                        .corner_radius(12)
+                        .tint(Color32::WHITE.gamma_multiply(alpha)),
+                    );
+                }
+                None => {
+                    let (r, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+                    ui.painter().rect_filled(r, 12.0, p.control);
+                    ui.painter().text(
+                        r.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "🎮",
+                        egui::FontId::proportional(30.0),
+                        p.text_faint,
+                    );
+                }
+            }
+            ui.add_space(6.0);
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 5.0;
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::Label::new(RichText::new(&g.game.name).font(theme::semibold(18.0)).color(p.text))
+                            .truncate(),
+                    );
+                });
+                let mut sub = Vec::new();
+                if !g.game.publisher.is_empty() {
+                    sub.push(g.game.publisher.clone());
+                }
+                if let Some(v) = &g.game.display_version {
+                    sub.push(format!("v{v}"));
+                }
+                sub.push(format!("{:016X}", g.game.application_id));
+                ui.label(RichText::new(sub.join("  ·  ")).size(12.5).color(p.text_dim));
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    let chosen = g.chosen();
+                    let base = chosen.iter().any(|t| t.kind == TitleKind::Base);
+                    let upd = chosen.iter().find(|t| t.kind == TitleKind::Update);
+                    let dlc = chosen.iter().filter(|t| matches!(t.kind, TitleKind::Dlc | TitleKind::DlcUpdate)).count();
+                    if base {
+                        theme::pill(ui, "Base", p.ok);
+                    } else {
+                        theme::pill(ui, "No base", p.warn);
+                    }
+                    if let Some(u) = upd {
+                        theme::pill(ui, format!("Update {}", u.version_label()), p.info)
+                            .on_hover_text(format!("Internal version {}", u.version));
+                    }
+                    if dlc > 0 {
+                        theme::pill(ui, format!("{dlc} DLC"), p.dlc);
+                    }
+                    if !g.game.superseded.is_empty() {
+                        theme::pill(ui, format!("{} left out", g.game.superseded.len()), p.text_dim)
+                            .on_hover_text("Older versions or duplicates that won't be included");
+                    }
+                    let size: u64 = chosen.iter().map(|t| t.size(deltas)).sum();
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(format_size(size)).color(p.text_dim));
+                });
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if theme::icon_button(ui, !busy, "✕", "Remove from list").clicked() {
+                    action = CardAction::Remove;
+                }
+                let can_build = !busy && !g.chosen().is_empty();
+                match &g.status {
+                    Status::Done(paths) => {
+                        if let Some(path) = paths.first() {
+                            if theme::secondary_button(ui, true, "Show in folder")
+                                .on_hover_text(path.display().to_string())
+                                .clicked()
+                            {
+                                reveal(path);
+                            }
+                        }
+                        status_pill(ui, p.ok, "Built");
+                    }
+                    Status::Building { done, total } => {
+                        let pct = *done as f32 / (*total).max(1) as f32 * 100.0;
+                        status_pill(ui, p.accent, &format!("Building {pct:.0}%"));
+                    }
+                    Status::Queued => {
+                        status_pill(ui, p.text_dim, "Queued");
+                    }
+                    Status::Failed(e) => {
+                        if theme::secondary_button(ui, can_build, "Retry").clicked() {
+                            action = CardAction::Build;
+                        }
+                        status_pill(ui, p.err, "Failed").on_hover_text(e);
+                    }
+                    Status::Ready => {
+                        if theme::secondary_button(ui, can_build, "Build").clicked() {
+                            action = CardAction::Build;
+                        }
+                    }
+                }
+            });
+        });
+
+        if let Status::Building { done, total } = g.status {
+            ui.add_space(10.0);
+            let w = ui.available_width();
+            theme::progress_bar(ui, id.with("bar"), done as f32 / total.max(1) as f32, w);
+        }
+        if let Status::Failed(e) = &g.status {
+            ui.add_space(6.0);
+            ui.label(RichText::new(format!("✖ {e}")).size(12.5).color(p.err));
+        }
+        for w in g.game.warnings() {
+            ui.label(RichText::new(format!("⚠  {w}")).size(12.5).color(p.warn));
+        }
+
+        ui.add_space(10.0);
+        let rect = ui.available_rect_before_wrap();
+        ui.painter().hline(rect.x_range(), rect.top(), egui::Stroke::new(1.0, p.border));
+        ui.add_space(8.0);
+
+        let state_id = id.with(("contents", g.game.superseded.len()));
+        let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
+            ui.ctx(),
+            state_id,
+            !g.game.superseded.is_empty(),
+        );
+        ui.horizontal(|ui| {
+            let open = state.openness(ui.ctx());
+            let n = g.game.titles.len() + g.game.superseded.len();
+            let arrow = if open > 0.5 { "⏷" } else { "⏵" };
+            let label = format!("{arrow}  Contents  ·  {n} item{}", if n == 1 { "" } else { "s" });
+            if theme::ghost_button(ui, true, RichText::new(label).color(p.text_dim)).clicked() {
+                state.toggle(ui);
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let out = out_dir.join(format!("{}.xci", g.file_stem()));
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!("→  {}", out.file_name().unwrap_or_default().to_string_lossy()))
+                            .size(12.5)
+                            .color(p.text_dim),
+                    )
+                    .truncate(),
+                )
+                .on_hover_text(out.display().to_string());
+            });
+        });
+        state.show_body_unindented(ui, |ui| {
+            ui.add_space(4.0);
+            egui::Frame::new().fill(p.input).corner_radius(10).inner_margin(egui::Margin::symmetric(10, 6)).show(
+                ui,
+                |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    for t in &g.game.titles {
+                        let mut on = !g.excluded.contains(&t.title_id);
+                        let changed = content_row(ui, &p, t, deltas, None, !on, |ui| {
+                            check_circle(ui, &mut on, !busy, 18.0).changed()
+                        });
+                        if changed {
+                            if on {
+                                g.excluded.remove(&t.title_id);
+                            } else {
+                                g.excluded.insert(t.title_id);
+                            }
+                        }
+                    }
+                    for t in &g.game.superseded {
+                        let dup = g.game.titles.iter().any(|k| k.title_id == t.title_id && k.version == t.version);
+                        content_row(ui, &p, t, deltas, Some(if dup { "duplicate" } else { "older" }), true, |_| false);
+                    }
+                },
+            );
+        });
+    });
+    let hovered_now = ui.rect_contains_pointer(resp.response.rect);
+    if hovered_now != hovered {
+        ui.ctx().data_mut(|d| d.insert_temp(id, hovered_now));
+    }
+    action
+}
+
+/// One row of the contents table with fixed-width columns.
+fn content_row(
+    ui: &mut egui::Ui,
+    p: &theme::Palette,
+    t: &Title,
+    deltas: bool,
+    note: Option<&str>,
+    faded: bool,
+    lead: impl FnOnce(&mut egui::Ui) -> bool,
+) -> bool {
+    let strike = note.is_some();
+    let text_c = if faded { p.text_faint } else { p.text };
+    let dim_c = if faded { p.text_faint } else { p.text_dim };
+    let rt = |s: String, c: Color32| {
+        let r = RichText::new(s).color(c);
+        if strike {
+            r.strikethrough()
+        } else {
+            r
+        }
+    };
+    let bg = ui.painter().add(egui::Shape::Noop);
+    let mut changed = false;
+    let row = ui.horizontal(|ui| {
+        ui.set_min_height(32.0);
+        ui.spacing_mut().item_spacing.x = 0.0;
+        let cell = |ui: &mut egui::Ui, w: f32, add: &mut dyn FnMut(&mut egui::Ui)| {
+            ui.allocate_ui_with_layout(egui::vec2(w, 28.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.set_min_width(w);
+                add(ui);
+            });
+        };
+        let mut lead = Some(lead);
+        cell(ui, 32.0, &mut |ui| {
+            ui.add_space(4.0);
+            if let Some(f) = lead.take() {
+                changed = f(ui);
+            }
+        });
+        let kc = if faded { p.text_faint } else { kind_color(p, t.kind) };
+        cell(ui, 92.0, &mut |ui| {
+            theme::pill(ui, t.kind.label(), kc);
+        });
+        cell(ui, 150.0, &mut |ui| {
+            ui.label(rt(format!("{:016X}", t.title_id), dim_c).monospace());
+        });
+        cell(ui, 100.0, &mut |ui| {
+            ui.label(rt(t.version_label(), text_c)).on_hover_text(format!("Internal version {}", t.version));
+        });
+        cell(ui, 92.0, &mut |ui| {
+            ui.label(rt(format_size(t.size(deltas)), text_c));
+        });
+        cell(ui, 88.0, &mut |ui| {
+            let fw = t.required_system_version.map(|r| format!("FW {}", format_rsv(r))).unwrap_or_default();
+            ui.label(rt(fw, dim_c));
+        });
+        cell(ui, 90.0, &mut |ui| {
+            if let Some(n) = note {
+                theme::pill(ui, n, p.text_faint);
+            }
+        });
+        let file = t.source.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        ui.add(egui::Label::new(rt(file, dim_c)).truncate()).on_hover_text(t.source.display().to_string());
+    });
+    let rect = row.response.rect.expand2(egui::vec2(4.0, 0.0));
+    if ui.rect_contains_pointer(rect) {
+        ui.painter().set(bg, egui::Shape::rect_filled(rect, 6.0, p.control.gamma_multiply(0.6)));
+    }
+    changed
+}
+
+/// Round checkbox.
+fn check_circle(ui: &mut egui::Ui, on: &mut bool, enabled: bool, size: f32) -> egui::Response {
+    let p = theme::palette(ui);
+    let sense = if enabled { egui::Sense::click() } else { egui::Sense::hover() };
+    let (rect, mut resp) = ui.allocate_exact_size(egui::vec2(size, size), sense);
+    if resp.clicked() {
+        *on = !*on;
+        resp.mark_changed();
+    }
+    let t = ui.ctx().animate_bool_with_time(resp.id, *on, 0.12);
+    let painter = ui.painter();
+    let c = rect.center();
+    let r = size / 2.0 - 1.0;
+    let ring = if resp.hovered() { p.text_dim } else { p.border_strong };
+    painter.circle_stroke(c, r, egui::Stroke::new(1.5, theme::lerp_color(ring, p.accent, t)));
+    if t > 0.0 {
+        painter.circle_filled(c, r * t, p.accent);
+        let s = size / 22.0;
+        let pts = vec![c + egui::vec2(-5.0, 0.0) * s, c + egui::vec2(-1.5, 3.5) * s, c + egui::vec2(5.0, -4.0) * s];
+        painter.add(egui::Shape::line(pts, egui::Stroke::new(2.0 * s, Color32::WHITE.gamma_multiply(t))));
+    }
+    if !enabled {
+        return resp;
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+fn fmt_secs(s: f64) -> String {
+    let s = s.round() as u64;
+    if s >= 3600 {
+        format!("{}h {:02}m", s / 3600, (s % 3600) / 60)
+    } else if s >= 60 {
+        format!("{}m {:02}s", s / 60, s % 60)
+    } else {
+        format!("{s}s")
+    }
+}
+
+/// Opens the system file manager with `p` selected.
+fn reveal(p: &Path) {
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("explorer").arg("/select,").arg(p).spawn();
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg("-R").arg(p).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if let Some(dir) = p.parent() {
+        let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+    }
+}
+
+impl eframe::App for App {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = &ui.ctx().clone();
+        self.poll(ctx);
+        if let Some(path) = &self.debug.screenshot {
+            debug_screenshot(ctx, path);
+        }
+        if self.debug.auto_build && ctx.cumulative_frame_nr() == 40 && !self.busy() {
+            self.start_build(ctx, None);
+        }
+
+        // Drag & drop.
+        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
+        if !dropped.is_empty() {
+            if self.job.is_some() {
+                self.log("Can't add files while building. Wait for it to finish.", true);
+            } else {
+                self.add_paths(ctx, dropped);
+            }
+        }
+        let hovering = ctx.input(|i| !i.raw.hovered_files.is_empty());
+        let p = theme::palette(ui);
+
+        egui::Panel::top("top")
+            .frame(egui::Frame::new().fill(p.panel).inner_margin(egui::Margin::symmetric(18, 12)))
+            .show(ui, |ui| self.header(ui));
+        egui::Panel::bottom("bottom")
+            .frame(egui::Frame::new().fill(p.panel).inner_margin(egui::Margin::symmetric(20, 14)))
+            .show(ui, |ui| self.bottom_bar(ui));
+        if self.show_log {
+            egui::Panel::bottom("log")
+                .resizable(true)
+                .default_size(150.0)
+                .frame(egui::Frame::new().fill(p.bg).inner_margin(egui::Margin::symmetric(20, 10)))
+                .show(ui, |ui| self.log_panel(ui));
+        }
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(p.bg).inner_margin(egui::Margin { left: 20, right: 20, top: 18, bottom: 8 }))
+            .show(ui, |ui| {
+                if self.games.is_empty() && self.scan_rx.is_none() {
+                    self.drop_zone(ui, hovering);
+                } else {
+                    self.game_list(ui);
+                }
+            });
+
+        if self.show_settings {
+            self.settings_modal(ctx);
+        }
+
+        if hovering && !self.games.is_empty() {
+            let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("drop")));
+            let rect = ctx.content_rect();
+            painter.rect_filled(rect, 0.0, p.bg.gamma_multiply(0.85));
+            let inner = rect.shrink(18.0);
+            painter.rect_filled(inner, 18.0, p.accent.gamma_multiply(0.08));
+            theme::dashed_rect(&painter, inner, egui::Stroke::new(2.0, p.accent));
+            painter.text(
+                inner.center() - egui::vec2(0.0, 14.0),
+                egui::Align2::CENTER_CENTER,
+                "Drop to add",
+                theme::semibold(28.0),
+                p.text,
+            );
+            painter.text(
+                inner.center() + egui::vec2(0.0, 20.0),
+                egui::Align2::CENTER_CENTER,
+                "Files are grouped by game automatically",
+                egui::FontId::proportional(14.0),
+                p.text_dim,
+            );
+        }
+    }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(storage, eframe::APP_KEY, &self.settings);
+    }
+}
+
+/// Saves a screenshot of the window to `path` after ~2 s and exits (see [`DebugHooks`]).
+fn debug_screenshot(ctx: &egui::Context, path: &Path) {
+    if ctx.cumulative_frame_nr() == 120 {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
+    }
+    let shot = ctx.input(|i| {
+        i.raw.events.iter().find_map(|e| match e {
+            egui::Event::Screenshot { image, .. } => Some(image.clone()),
+            _ => None,
+        })
+    });
+    if let Some(image) = shot {
+        let [w, h] = image.size;
+        let raw: Vec<u8> = image.pixels.iter().flat_map(|p| p.to_array()).collect();
+        if let Some(img) = image::RgbaImage::from_raw(w as u32, h as u32, raw) {
+            let _ = img.save(path);
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+    ctx.request_repaint();
+}

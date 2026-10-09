@@ -1,0 +1,21 @@
+[package]
+name = "cartwrite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "cartwrite"
+path = "src/main.rs"
+
+[dependencies]
+cartwrite-core = { path = "../cartwrite-core" }
+eframe = { version = "0.36", features = ["persistence"] }
+egui_extras = { version = "0.36", features = ["image"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+rfd = "0.17"
+serde = { version = "1", features = ["derive"] }
+
+[build-dependencies]
+image = { version = "0.25", default-features = false, features = ["ico", "png"] }
+winresource = "0.1"

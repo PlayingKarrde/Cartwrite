@@ -1,0 +1,14 @@
+[package]
+name = "cartwrite-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aes = "0.8"
+sha2 = "0.10"
+zstd = "0.13"
+miniz_oxide = "0.8"
+thiserror = "2"
+rand = "0.8"
+dirs = "6"

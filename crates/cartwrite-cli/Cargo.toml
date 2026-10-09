@@ -1,0 +1,12 @@
+[package]
+name = "cartwrite-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "cartwrite-cli"
+path = "src/main.rs"
+
+[dependencies]
+cartwrite-core = { path = "../cartwrite-core" }
