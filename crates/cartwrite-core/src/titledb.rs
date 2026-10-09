@@ -158,12 +158,12 @@ fn parse_json(text: &str) -> Result<BTreeMap<u64, u32>> {
     Ok(out)
 }
 
-fn is_url(source: &str) -> bool {
+pub(crate) fn is_url(source: &str) -> bool {
     let s = source.trim().to_ascii_lowercase();
     s.starts_with("http://") || s.starts_with("https://")
 }
 
-fn cache_dir() -> Option<PathBuf> {
+pub(crate) fn cache_dir() -> Option<PathBuf> {
     dirs::cache_dir().map(|d| d.join("Cartwrite"))
 }
 
@@ -194,10 +194,8 @@ pub fn fetch(source: &str) -> Result<TitleDb> {
         return TitleDb::parse(&text, source, fetched);
     }
 
-    let agent = ureq::AgentBuilder::new().timeout_connect(CONNECT_TIMEOUT).timeout(TOTAL_TIMEOUT).build();
-    let resp = agent.get(source).call().map_err(|e| Error::Network(network_message(e)))?;
     let mut text = String::new();
-    resp.into_reader()
+    http_get(source, TOTAL_TIMEOUT)?
         .take(MAX_DOWNLOAD)
         .read_to_string(&mut text)
         .map_err(|e| Error::Network(format!("download interrupted: {e}")))?;
@@ -227,6 +225,13 @@ pub fn load(source: &str, force_refresh: bool) -> (Option<TitleDb>, Option<Error
         Ok(db) => (Some(db), None),
         Err(e) => (cached, Some(e)),
     }
+}
+
+/// Starts an HTTP GET with a short connect timeout and an overall `timeout`.
+pub(crate) fn http_get(url: &str, timeout: Duration) -> Result<impl Read + Send> {
+    let agent = ureq::AgentBuilder::new().timeout_connect(CONNECT_TIMEOUT).timeout(timeout).build();
+    let resp = agent.get(url).call().map_err(|e| Error::Network(network_message(e)))?;
+    Ok(resp.into_reader())
 }
 
 fn network_message(e: ureq::Error) -> String {

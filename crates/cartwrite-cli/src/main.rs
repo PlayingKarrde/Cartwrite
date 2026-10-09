@@ -1,6 +1,6 @@
 //! Command-line front end, mainly for scripting and testing.
 //!
-//!   cartwrite-cli info  <files/folders...>
+//!   cartwrite-cli info  [--regions | --regions-from URL|DIR] <files/folders...>
 //!   cartwrite-cli check [--titledb URL|FILE] [--refresh] <files/folders...>
 //!   cartwrite-cli build [-o DIR] [--no-rsv] [--fat32] [--deltas] [--keys FILE] <files/folders...>
 
@@ -10,13 +10,14 @@ use std::time::Instant;
 
 use cartwrite_core::build::{build_xci, BuildOptions, Progress};
 use cartwrite_core::plan::{group, output_stem};
+use cartwrite_core::regions::{self, Region};
 use cartwrite_core::rsv::format_rsv;
 use cartwrite_core::scan::{collect_files, scan_file, Title};
 use cartwrite_core::titledb::{self, Report, DEFAULT_SOURCE};
 use cartwrite_core::util::{format_age as age, format_size};
 use cartwrite_core::Keys;
 
-const USAGE: &str = "usage: cartwrite-cli info <files...>
+const USAGE: &str = "usage: cartwrite-cli info [--regions | --regions-from URL|DIR] <files...>
        cartwrite-cli check [--titledb URL|FILE] [--refresh] <files...>
        cartwrite-cli build [-o DIR] [--no-rsv] [--fat32] [--deltas] [--keys FILE] <files...>";
 
@@ -40,6 +41,7 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
     let mut opts = BuildOptions::default();
     let mut titledb_source = DEFAULT_SOURCE.to_string();
     let mut refresh = false;
+    let mut regions_source: Option<String> = None;
     let mut inputs = Vec::new();
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -50,6 +52,8 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
             "--deltas" => opts.include_deltas = true,
             "--titledb" => titledb_source = args.next().ok_or("--titledb needs a URL or file")?,
             "--refresh" => refresh = true,
+            "--regions" => regions_source = Some(regions::DEFAULT_SOURCE.into()),
+            "--regions-from" => regions_source = Some(args.next().ok_or("--regions-from needs a URL or folder")?),
             flag if flag.starts_with('-') => return Err(format!("unknown option {flag}\n{USAGE}").into()),
             _ => inputs.push(PathBuf::from(a)),
         }
@@ -88,8 +92,36 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
         None
     };
 
+    let region_db = match &regions_source {
+        Some(src) => {
+            let (db, err) = regions::load(src, refresh, &mut |i, r| {
+                eprintln!("Downloading region list {} of {}: {}", i + 1, Region::ALL.len(), r.name())
+            });
+            match (&db, err) {
+                (Some(db), Some(e)) => {
+                    eprintln!("warning: couldn't refresh region lists ({e}); using the copy from {}", age(db.fetched))
+                }
+                (None, Some(e)) => return Err(format!("couldn't get region lists from {src}: {e}").into()),
+                _ => {}
+            }
+            db
+        }
+        None => None,
+    };
+
     for g in &games {
+        let regions_line = region_db.as_ref().map(|rdb| {
+            let codes: Vec<&str> = rdb.for_game(g).iter().map(|r| r.code()).collect();
+            if codes.is_empty() {
+                "unknown".to_string()
+            } else {
+                codes.join(", ")
+            }
+        });
         println!("\n{} [{:016X}] {}", g.name, g.application_id, g.display_version.as_deref().unwrap_or(""));
+        if let Some(r) = &regions_line {
+            println!("  regions: {r}");
+        }
         for t in &g.titles {
             print_title("  +", t);
         }

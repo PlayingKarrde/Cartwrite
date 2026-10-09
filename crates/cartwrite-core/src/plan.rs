@@ -1,6 +1,7 @@
 //! Groups scanned titles by game and picks the newest version of each.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::scan::{Title, TitleKind};
@@ -16,6 +17,8 @@ pub struct Game {
     pub titles: Vec<Title>,
     /// Older versions / duplicates that will be left out.
     pub superseded: Vec<Title>,
+    /// Problems that involve other games, e.g. DLC from a different release in the same file.
+    pub notes: Vec<String>,
 }
 
 impl Game {
@@ -24,8 +27,9 @@ impl Game {
     }
 
     pub fn warnings(&self) -> Vec<String> {
-        let mut w: Vec<String> = Vec::new();
-        if self.base().is_none() {
+        let mut w: Vec<String> = self.notes.clone();
+        // A note already explains why DLC have no base game here.
+        if self.base().is_none() && self.notes.is_empty() {
             w.push("No base game, so the XCI will only contain updates/DLC.".into());
         }
         for t in &self.titles {
@@ -87,7 +91,7 @@ pub fn group(titles: Vec<Title>) -> Vec<Game> {
     for t in titles {
         by_app.entry(t.application_id).or_default().push(t);
     }
-    by_app
+    let mut games = by_app
         .into_iter()
         .map(|(application_id, mut list)| {
             // Newest first so the first occurrence of each title ID wins.
@@ -117,9 +121,50 @@ pub fn group(titles: Vec<Title>) -> Vec<Game> {
                 .filter(|t| t.kind == TitleKind::Update)
                 .chain(titles.iter().filter(|t| t.kind == TitleKind::Base))
                 .find_map(|t| t.icon.clone());
-            Game { application_id, name, publisher, display_version, icon, titles, superseded }
+            Game { application_id, name, publisher, display_version, icon, titles, superseded, notes: Vec::new() }
         })
-        .collect()
+        .collect::<Vec<_>>();
+    note_mismatched_dlc(&mut games);
+    games
+}
+
+/// Finds DLC that sit in the same file as another game's base or update but belong to a
+/// different application ID (typically another region's release). The game in the file
+/// won't load them, which otherwise just looks like a confusing "no base game" entry.
+fn note_mismatched_dlc(games: &mut [Game]) {
+    let sources = |g: &Game| -> HashSet<PathBuf> { g.titles.iter().map(|t| t.source.as_ref().clone()).collect() };
+    let has_game = |g: &Game| g.titles.iter().any(|t| matches!(t.kind, TitleKind::Base | TitleKind::Update));
+    let dlc_only = |g: &Game| !has_game(g) && g.titles.iter().any(|t| t.kind == TitleKind::Dlc);
+
+    let mut notes: Vec<(usize, String)> = Vec::new();
+    for (i, orphan) in games.iter().enumerate().filter(|(_, g)| dlc_only(g)) {
+        let orphan_sources = sources(orphan);
+        let dlc_count = orphan.titles.iter().filter(|t| t.kind == TitleKind::Dlc).count();
+        for (j, owner) in games.iter().enumerate().filter(|(j, g)| *j != i && has_game(g)) {
+            let owner_sources = sources(owner);
+            let Some(file) = owner_sources.iter().find(|p| orphan_sources.contains(*p)) else { continue };
+            let file = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            notes.push((
+                i,
+                format!(
+                    "These DLC belong to a different release ({:016X}) than {} ({:016X}) in the same file, so that game won't load them.",
+                    orphan.application_id, owner.name, owner.application_id
+                ),
+            ));
+            notes.push((
+                j,
+                format!(
+                    "{file} also has {dlc_count} DLC for a different release ({:016X}). This game won't load them, so they're listed separately.",
+                    orphan.application_id
+                ),
+            ));
+        }
+    }
+    for (i, note) in notes {
+        if !games[i].notes.contains(&note) {
+            games[i].notes.push(note);
+        }
+    }
 }
 
 /// Strips `[..]` / `(..)` tags from a file name to guess a title.
@@ -200,6 +245,38 @@ pub(crate) mod tests {
         assert_eq!(kept, vec![(TitleKind::Base, 0), (TitleKind::Update, 131072), (TitleKind::Dlc, 0)]);
         assert_eq!(g.superseded.len(), 2);
         assert_eq!(g.display_version.as_deref(), Some("1.2.0"));
+    }
+
+    #[test]
+    fn dlc_for_another_release_in_the_same_file_is_explained() {
+        let other_app = 0x0100_0000_0005_0000;
+        let file = Arc::new(PathBuf::from("mixed.xci"));
+        let mut titles = vec![
+            title(TitleKind::Base, BASE, 0, Some("1.0.0")),
+            title(TitleKind::Update, BASE | 0x800, 65536, Some("1.0.1")),
+            title(TitleKind::Dlc, other_app + 0x1001, 0, None),
+        ];
+        for t in &mut titles {
+            t.source = file.clone();
+        }
+        let games = group(titles);
+        assert_eq!(games.len(), 2);
+        let main = games.iter().find(|g| g.application_id == BASE).unwrap();
+        let orphan = games.iter().find(|g| g.application_id == other_app).unwrap();
+        assert!(main.warnings()[0].contains("1 DLC for a different release (0100000000050000)"));
+        let w = orphan.warnings();
+        assert!(w[0].contains("different release (0100000000050000) than Game (0100000000010000)"), "{w:?}");
+        assert!(!w.iter().any(|m| m.starts_with("No base game")), "{w:?}");
+    }
+
+    #[test]
+    fn dlc_in_its_own_file_is_not_flagged() {
+        let other_app = 0x0100_0000_0005_0000;
+        let games = group(vec![
+            title(TitleKind::Base, BASE, 0, Some("1.0.0")),
+            title(TitleKind::Dlc, other_app + 0x1001, 0, None),
+        ]);
+        assert!(games.iter().all(|g| g.notes.is_empty()));
     }
 
     #[test]

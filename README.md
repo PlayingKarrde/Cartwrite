@@ -23,6 +23,10 @@ it.
 - Can split output into 4 GB parts for FAT32 SD cards.
 - Optional check for newer updates and missing DLC against a title database you choose. Off by
   default.
+- Optional region badges (US, EU, JP, Asia, KR) showing which eShop each release comes from.
+  Off by default.
+- Spots DLC that belong to a different release than the game they're packed with, which a
+  game won't load.
 - Dark and light themes.
 
 ## Getting started
@@ -115,6 +119,37 @@ How it works:
 
 The check only tells you something newer exists. Cartwrite doesn't download game content.
 
+### See which region each release is from
+
+Switch title IDs don't say which region a release is from, and some games have separate
+releases per region, each with its own title ID, update and DLC. Turn on **Show which region
+each release is from** in Settings and each game card shows a small flag for every eShop
+that lists it: US, EU, JP, Asia (Hong Kong eShop) and KR. Most games are sold worldwide under
+one title ID and show several flags.
+
+- The data comes from titledb's per-country eShop lists (`US.en.json`, `GB.en.json`,
+  `JP.ja.json`, `HK.zh.json` and `KR.ko.json`). Together they're about 100 MB to download,
+  so this is off by default.
+- Only a small summary (under 1 MB) is kept. It's refreshed once a month, or when you click
+  **Refresh now**, and the download runs in the background.
+- The source can be any URL or a local folder that holds those five files.
+
+![Region badges](docs/screenshots/regions.png)
+
+### DLC from a different release
+
+Each DLC records which game it belongs to, and a game only loads DLC made for its own title
+ID. If a file mixes releases, for example a Japanese base game with European DLC, Cartwrite
+lists the DLC as a separate entry and explains why:
+
+- the DLC's card says they belong to a different release than the game in the same file, so
+  that game won't load them;
+- the game's card says the file also holds DLC for another release.
+
+That DLC entry starts unticked, since building it on its own is rarely useful. To get DLC that
+works, use the DLC from the same release as your base game. With region badges turned on it's
+easy to see which release is which, as in the screenshot above.
+
 ### Output file names
 
 Files are named like this:
@@ -143,6 +178,8 @@ Settings are in the gear menu. The most used ones are also at the bottom of the 
 | Delete the old XCI after rebuilding it | Off | See [Update an XCI you already have](#update-an-xci-you-already-have). |
 | Check for newer updates and missing DLC | Off | See [Check for newer updates and missing DLC](#check-for-newer-updates-and-missing-dlc). |
 | Title database source | blawar/titledb `versions.txt` | Where the update check gets its data. Any URL or a local file. |
+| Show which region each release is from | Off | See [See which region each release is from](#see-which-region-each-release-is-from). |
+| Region lists source | blawar/titledb | Where the region lists come from. Any URL or a local folder. |
 | Theme | Dark, NX style | Dark, light or follow the system. There is also a violet colour style. |
 
 ## Command line
@@ -150,12 +187,14 @@ Settings are in the gear menu. The most used ones are also at the bottom of the 
 `cartwrite-cli` does the same job from a terminal, which is handy for scripts.
 
 ```
-cartwrite-cli info  <files or folders...>
+cartwrite-cli info  [--regions | --regions-from URL|DIR] <files or folders...>
 cartwrite-cli check [--titledb URL|FILE] [--refresh] <files or folders...>
 cartwrite-cli build [-o DIR] [--no-rsv] [--fat32] [--deltas] [--keys FILE] <files or folders...>
 ```
 
 - `info` lists every game found, with each title's version, size, required firmware and source.
+  `--regions` adds the regions each release is listed in, using titledb's region lists;
+  `--regions-from` uses a different URL or folder for them.
 - `check` does the same and also reports newer updates and missing DLC. `--titledb` sets the
   database source (default: blawar/titledb `versions.txt`) and `--refresh` downloads it again
   even if the cached copy is recent.

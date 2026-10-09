@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use cartwrite_core::build::{build_xci, BuildOptions, Progress};
+use cartwrite_core::regions::{self, Region, RegionDb};
 use cartwrite_core::scan::{collect_files, scan_file, Title};
 use cartwrite_core::titledb::{self, TitleDb};
 use cartwrite_core::{Error, Keys};
@@ -48,6 +49,32 @@ pub fn spawn_titledb(ctx: eframe::egui::Context, source: String, force: bool) ->
             Ok((db, err.map(|e| e.to_string())))
         });
         let _ = tx.send(result.unwrap_or_else(|e| (None, Some(e))));
+        ctx.request_repaint();
+    });
+    rx
+}
+
+pub enum RegionMsg {
+    /// About to download region list `index` (0-based) of [`Region::ALL`].
+    Progress(usize, Region),
+    Done(Option<RegionDb>, Option<String>),
+}
+
+/// Loads the region index in the background (cache first, download if stale or forced).
+pub fn spawn_regions(ctx: eframe::egui::Context, source: String, force: bool) -> Receiver<RegionMsg> {
+    let (tx, rx) = channel();
+    std::thread::spawn(move || {
+        let progress_tx = tx.clone();
+        let progress_ctx = ctx.clone();
+        let result: Result<(Option<RegionDb>, Option<String>), String> = guarded(|| {
+            let (db, err) = regions::load(&source, force, &mut |i, r| {
+                let _ = progress_tx.send(RegionMsg::Progress(i, r));
+                progress_ctx.request_repaint();
+            });
+            Ok((db, err.map(|e| e.to_string())))
+        });
+        let (db, err) = result.unwrap_or_else(|e| (None, Some(e)));
+        let _ = tx.send(RegionMsg::Done(db, err));
         ctx.request_repaint();
     });
     rx

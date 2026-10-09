@@ -11,6 +11,7 @@ pub mod nacp;
 pub mod nca;
 pub mod ncz;
 pub mod plan;
+pub mod regions;
 pub mod romfs;
 pub mod rsv;
 pub mod scan;

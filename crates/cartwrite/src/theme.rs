@@ -495,6 +495,62 @@ pub fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
     Color32::from_rgba_unmultiplied(l(a.r(), b.r()), l(a.g(), b.g()), l(a.b(), b.b()), l(a.a(), b.a()))
 }
 
+/// Paints a small, simplified flag for a region (Windows has no flag emoji).
+pub fn paint_flag(painter: &egui::Painter, rect: egui::Rect, region: cartwrite_core::regions::Region) {
+    use cartwrite_core::regions::Region;
+    let white = Color32::from_rgb(245, 245, 245);
+    let c = rect.center();
+    let h = rect.height();
+    let painter = painter.with_clip_rect(rect);
+    match region {
+        Region::Jp => {
+            painter.rect_filled(rect, 0.0, white);
+            painter.circle_filled(c, h * 0.3, Color32::from_rgb(0xBC, 0x00, 0x2D));
+        }
+        Region::Us => {
+            let red = Color32::from_rgb(0xB2, 0x22, 0x34);
+            let stripe = h / 7.0;
+            for i in 0..7 {
+                let r = egui::Rect::from_min_size(
+                    egui::pos2(rect.left(), rect.top() + i as f32 * stripe),
+                    egui::vec2(rect.width(), stripe),
+                );
+                painter.rect_filled(r, 0.0, if i % 2 == 0 { red } else { white });
+            }
+            let canton = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width() * 0.45, stripe * 4.0));
+            painter.rect_filled(canton, 0.0, Color32::from_rgb(0x3C, 0x3B, 0x6E));
+        }
+        Region::Eu => {
+            painter.rect_filled(rect, 0.0, Color32::from_rgb(0x00, 0x33, 0x99));
+            for i in 0..12 {
+                let a = i as f32 / 12.0 * std::f32::consts::TAU;
+                let p = c + egui::vec2(a.cos(), a.sin()) * h * 0.32;
+                painter.circle_filled(p, (h * 0.06).max(0.7), Color32::from_rgb(0xFF, 0xCC, 0x00));
+            }
+        }
+        Region::Asia => {
+            painter.rect_filled(rect, 0.0, Color32::from_rgb(0xDE, 0x29, 0x10));
+            for i in 0..5 {
+                let a = i as f32 / 5.0 * std::f32::consts::TAU - std::f32::consts::FRAC_PI_2;
+                painter.circle_filled(c + egui::vec2(a.cos(), a.sin()) * h * 0.17, h * 0.13, white);
+            }
+        }
+        Region::Kr => {
+            painter.rect_filled(rect, 0.0, white);
+            let r = h * 0.27;
+            painter.circle_filled(c, r, Color32::from_rgb(0x00, 0x47, 0xA0));
+            let top = egui::Rect::from_min_max(egui::pos2(c.x - r, c.y - r), egui::pos2(c.x + r, c.y));
+            painter.with_clip_rect(top).circle_filled(c, r, Color32::from_rgb(0xCD, 0x2E, 0x3A));
+            let bar = Color32::from_rgb(40, 40, 40);
+            for (dx, dy) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+                let p = c + egui::vec2(dx * rect.width() * 0.33, dy * h * 0.3);
+                painter.rect_filled(egui::Rect::from_center_size(p, egui::vec2(h * 0.22, h * 0.14)), 0.0, bar);
+            }
+        }
+    }
+    painter.rect_stroke(rect, 1.0, Stroke::new(0.5, Color32::from_black_alpha(60)), egui::StrokeKind::Inside);
+}
+
 /// Draws a dashed rounded-ish rectangle outline.
 pub fn dashed_rect(painter: &egui::Painter, rect: egui::Rect, stroke: Stroke) {
     let pts = [rect.left_top(), rect.right_top(), rect.right_bottom(), rect.left_bottom(), rect.left_top()];

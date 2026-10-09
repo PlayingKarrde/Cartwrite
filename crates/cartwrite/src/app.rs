@@ -8,6 +8,7 @@ use std::time::Instant;
 use cartwrite_core::build::{BuildOptions, Progress};
 use cartwrite_core::container::ContainerKind;
 use cartwrite_core::plan::{group, output_stem, Game};
+use cartwrite_core::regions::{self, Region, RegionDb};
 use cartwrite_core::rsv::format_rsv;
 use cartwrite_core::scan::{Title, TitleKind, EXTENSIONS};
 use cartwrite_core::titledb::{self, Report, TitleDb};
@@ -16,7 +17,9 @@ use cartwrite_core::Keys;
 use eframe::egui::{self, Color32, RichText};
 
 use crate::theme::{self, ThemeChoice, ThemeStyle};
-use crate::worker::{spawn_build, spawn_scan, spawn_titledb, BuildJob, BuildMsg, ScanMsg, TitleDbResult};
+use crate::worker::{
+    spawn_build, spawn_regions, spawn_scan, spawn_titledb, BuildJob, BuildMsg, RegionMsg, ScanMsg, TitleDbResult,
+};
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -35,6 +38,10 @@ struct Settings {
     check_updates: bool,
     /// URL or local file of a titledb `versions.txt`.
     titledb_source: String,
+    /// Show which eShop region each release is from.
+    show_regions: bool,
+    /// URL or local folder of titledb's per-country lists.
+    regions_source: String,
 }
 
 impl Default for Settings {
@@ -51,6 +58,8 @@ impl Default for Settings {
             style: ThemeStyle::Nx,
             check_updates: false,
             titledb_source: titledb::DEFAULT_SOURCE.into(),
+            show_regions: false,
+            regions_source: regions::DEFAULT_SOURCE.into(),
         }
     }
 }
@@ -110,6 +119,17 @@ pub struct App {
     logo: Option<(Color32, egui::TextureHandle)>,
     debug: DebugHooks,
     titledb: TitleDbState,
+    regions: RegionState,
+}
+
+/// The optional region lookup's index and its loading state.
+#[derive(Default)]
+struct RegionState {
+    db: Option<Arc<RegionDb>>,
+    source: String,
+    rx: Option<Receiver<RegionMsg>>,
+    progress: Option<(usize, Region)>,
+    error: Option<String>,
 }
 
 /// The optional update / DLC check's database and its loading state.
@@ -135,6 +155,8 @@ struct DebugHooks {
     scroll_to_updates: bool,
     /// `CARTWRITE_DEBUG_TITLEDB=<source>`: turn the update check on with this source.
     titledb: Option<String>,
+    /// `CARTWRITE_DEBUG_REGIONS=1` turns the region lookup on; any other value is used as its source.
+    regions: Option<String>,
     // `CARTWRITE_DEBUG_THEME=light` is applied in `App::new` without touching saved settings.
 }
 
@@ -146,6 +168,7 @@ impl DebugHooks {
             open_settings: std::env::var_os("CARTWRITE_DEBUG_SETTINGS").is_some(),
             scroll_to_updates: std::env::var("CARTWRITE_DEBUG_SETTINGS").as_deref() == Ok("updates"),
             titledb: std::env::var("CARTWRITE_DEBUG_TITLEDB").ok(),
+            regions: std::env::var("CARTWRITE_DEBUG_REGIONS").ok(),
         }
     }
 }
@@ -176,14 +199,24 @@ impl App {
             logo: None,
             debug: DebugHooks::from_env(),
             titledb: TitleDbState::default(),
+            regions: RegionState::default(),
         };
         app.show_settings = app.debug.open_settings;
+        if let Some(source) = app.debug.regions.clone() {
+            app.settings.show_regions = true;
+            if source != "1" {
+                app.settings.regions_source = source;
+            }
+        }
         if let Some(source) = app.debug.titledb.clone() {
             app.settings.check_updates = true;
             app.settings.titledb_source = source;
         }
         if app.settings.check_updates {
             app.load_titledb(&cc.egui_ctx, false);
+        }
+        if app.settings.show_regions {
+            app.load_regions(&cc.egui_ctx, false);
         }
         app.load_keys();
         // Files passed on the command line / dropped onto the exe.
@@ -223,6 +256,54 @@ impl App {
         self.titledb.source = source.clone();
         self.titledb.error = None;
         self.titledb.rx = Some(spawn_titledb(ctx.clone(), source, force));
+    }
+
+    /// Starts loading the region index in the background (cache first unless `force`).
+    fn load_regions(&mut self, ctx: &egui::Context, force: bool) {
+        let source = self.settings.regions_source.trim().to_string();
+        if source != self.regions.source {
+            self.regions.db = None;
+        }
+        self.regions.source = source.clone();
+        self.regions.error = None;
+        self.regions.progress = None;
+        self.regions.rx = Some(spawn_regions(ctx.clone(), source, force));
+    }
+
+    fn poll_regions(&mut self) {
+        let Some(rx) = &self.regions.rx else { return };
+        loop {
+            match rx.try_recv() {
+                Ok(RegionMsg::Progress(i, r)) => self.regions.progress = Some((i, r)),
+                Ok(RegionMsg::Done(db, err)) => {
+                    self.regions.rx = None;
+                    self.regions.progress = None;
+                    if let Some(db) = db {
+                        self.regions.db = Some(Arc::new(db));
+                    }
+                    if let Some(e) = &err {
+                        self.log(format!("Region lists: {e}"), false);
+                    }
+                    self.regions.error = err;
+                    return;
+                }
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => {
+                    self.regions.rx = None;
+                    self.regions.progress = None;
+                    self.regions.error = Some("the download stopped unexpectedly".into());
+                    return;
+                }
+            }
+        }
+    }
+
+    fn active_regions(&self) -> Option<Arc<RegionDb>> {
+        if self.settings.show_regions {
+            self.regions.db.clone()
+        } else {
+            None
+        }
     }
 
     fn poll_titledb(&mut self) {
@@ -321,7 +402,13 @@ impl App {
                         },
                         icon,
                     },
-                    None => GameView { game, selected: true, excluded: HashSet::new(), status: Status::Ready, icon },
+                    None => {
+                        // DLC for another release than the game in the same file: building them on
+                        // their own is rarely wanted, so don't include them in "build all" by default.
+                        let mismatched = !game.notes.is_empty()
+                            && !game.titles.iter().any(|t| matches!(t.kind, TitleKind::Base | TitleKind::Update));
+                        GameView { game, selected: !mismatched, excluded: HashSet::new(), status: Status::Ready, icon }
+                    }
                 }
             })
             .collect();
@@ -330,6 +417,7 @@ impl App {
 
     fn poll(&mut self, ctx: &egui::Context) {
         self.poll_titledb();
+        self.poll_regions();
         if let Some(rx) = &self.scan_rx {
             let mut changed = false;
             let mut done = false;
@@ -844,6 +932,7 @@ impl App {
         let out_dir = self.settings.output_dir.clone();
         let deltas = self.settings.include_deltas;
         let titledb = self.active_titledb();
+        let region_db = self.active_regions();
         let mut build_one = None;
         let mut remove = None;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
@@ -854,7 +943,7 @@ impl App {
                         g.chosen().first().and_then(|t| t.source.parent().map(Path::to_path_buf)).unwrap_or_default()
                     }
                 };
-                match game_card(ui, g, job_running, &dir, deltas, titledb.as_deref()) {
+                match game_card(ui, g, job_running, &dir, deltas, titledb.as_deref(), region_db.as_deref()) {
                     CardAction::None => {}
                     CardAction::Build => build_one = Some(g.game.application_id),
                     CardAction::Remove => remove = Some(i),
@@ -940,11 +1029,75 @@ impl App {
         });
     }
 
+    /// Source field, refresh button and status for the region lookup (inside Settings).
+    fn region_settings(&mut self, ui: &mut egui::Ui, p: &theme::Palette, action: &mut Option<bool>) {
+        ui.add_space(2.0);
+        ui.label(RichText::new("Region lists source").color(p.text_dim));
+        let field = ui.add(
+            egui::TextEdit::singleline(&mut self.settings.regions_source)
+                .hint_text(regions::DEFAULT_SOURCE)
+                .desired_width(ui.available_width()),
+        );
+        if field.lost_focus() && self.settings.regions_source.trim() != self.regions.source {
+            *action = Some(false);
+        }
+        ui.label(
+            RichText::new(
+                "A URL or local folder containing titledb's US.en.json, GB.en.json, JP.ja.json, HK.zh.json and \
+                 KR.ko.json.",
+            )
+            .size(12.0)
+            .color(p.text_faint),
+        );
+        ui.add_space(4.0);
+        let loading = self.regions.rx.is_some();
+        ui.horizontal(|ui| {
+            if theme::secondary_button(ui, !loading, "Refresh now").clicked() {
+                *action = Some(true);
+            }
+            if self.settings.regions_source.trim() != regions::DEFAULT_SOURCE
+                && theme::ghost_button(ui, !loading, "Use default source").clicked()
+            {
+                self.settings.regions_source = regions::DEFAULT_SOURCE.into();
+                *action = Some(false);
+            }
+        });
+        ui.add_space(2.0);
+        ui.horizontal_wrapped(|ui| {
+            if loading {
+                ui.spinner();
+                let msg = match self.regions.progress {
+                    Some((i, r)) => {
+                        format!("Downloading region lists: {} of {}, {}", i + 1, Region::ALL.len(), r.name())
+                    }
+                    None => "Loading region lists…".into(),
+                };
+                ui.label(RichText::new(msg).color(p.text_dim));
+                return;
+            }
+            if let Some(db) = &self.regions.db {
+                status_pill(ui, p.ok, "Ready");
+                ui.label(
+                    RichText::new(format!("{} titles, updated {}", db.len(), format_age(db.fetched))).color(p.text_dim),
+                );
+            }
+            if let Some(e) = &self.regions.error {
+                let msg = if self.regions.db.is_some() {
+                    format!("Couldn't refresh ({e}), so the copy above is being used.")
+                } else {
+                    format!("Couldn't load the region lists: {e}")
+                };
+                ui.label(RichText::new(msg).color(p.err));
+            }
+        });
+    }
+
     fn settings_modal(&mut self, ctx: &egui::Context) {
         let p = theme::palette_for(theme::style(), ctx.theme() == egui::Theme::Dark);
         let mut close = false;
         let mut reload = false;
         let mut titledb_action: Option<bool> = None; // Some(force) to (re)load the database
+        let mut regions_action: Option<bool> = None;
         let frame = egui::Frame::new()
             .fill(p.panel)
             .stroke(egui::Stroke::new(1.0, p.border))
@@ -953,7 +1106,8 @@ impl App {
             .shadow(egui::epaint::Shadow { offset: [0, 16], blur: 48, spread: 0, color: p.shadow });
         let max_h = (ctx.content_rect().height() - 120.0).max(200.0);
         let modal = egui::Modal::new(egui::Id::new("settings")).frame(frame).show(ctx, |ui| {
-            ui.set_width(480.0);
+            ui.set_width(520.0);
+            ui.set_max_width(520.0);
             egui::ScrollArea::vertical().max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Settings").font(theme::semibold(20.0)));
@@ -1037,7 +1191,7 @@ impl App {
                     "When updating an existing XCI, remove the old file once the new one is written.",
                 );
 
-                section(ui, "UPDATE CHECK");
+                section(ui, "TITLE DATABASE");
                 if self.debug.scroll_to_updates {
                     ui.scroll_to_cursor(Some(egui::Align::TOP));
                 }
@@ -1054,6 +1208,22 @@ impl App {
                 if self.settings.check_updates {
                     self.titledb_settings(ui, &p, &mut titledb_action);
                 }
+
+                ui.add_space(8.0);
+                let was_on = self.settings.show_regions;
+                setting_toggle(
+                    ui,
+                    &mut self.settings.show_regions,
+                    "Show which region each release is from",
+                    "Downloads titledb's eShop lists for the US, Europe, Japan, Asia and Korea once (about 100 MB), \
+                     keeps a small summary and refreshes it monthly.",
+                );
+                if self.settings.show_regions && !was_on {
+                    regions_action = Some(false);
+                }
+                if self.settings.show_regions {
+                    self.region_settings(ui, &p, &mut regions_action);
+                }
             });
             ui.add_space(14.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1064,6 +1234,9 @@ impl App {
         });
         if close || modal.should_close() {
             self.show_settings = false;
+        }
+        if let Some(force) = regions_action {
+            self.load_regions(ctx, force);
         }
         if let Some(force) = titledb_action {
             self.load_titledb(ctx, force);
@@ -1091,7 +1264,7 @@ fn setting_toggle(ui: &mut egui::Ui, value: &mut bool, label: &str, hint: &str) 
         theme::toggle(ui, value, label, "");
         ui.horizontal(|ui| {
             ui.add_space(42.0);
-            ui.label(RichText::new(hint).size(12.0).color(p.text_dim));
+            ui.add(egui::Label::new(RichText::new(hint).size(12.0).color(p.text_dim)).wrap());
         });
     });
     ui.add_space(6.0);
@@ -1147,6 +1320,7 @@ fn game_card(
     out_dir: &Path,
     deltas: bool,
     titledb: Option<&TitleDb>,
+    region_db: Option<&RegionDb>,
 ) -> CardAction {
     let p = theme::palette(ui);
     let mut action = CardAction::None;
@@ -1211,7 +1385,12 @@ fn game_card(
                     sub.push(format!("v{v}"));
                 }
                 sub.push(format!("{:016X}", g.game.application_id));
-                ui.label(RichText::new(sub.join("  ·  ")).size(12.5).color(p.text_dim));
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(sub.join("  ·  ")).size(12.5).color(p.text_dim));
+                    if let Some(rdb) = region_db {
+                        region_badges(ui, &p, &rdb.for_game(&g.game));
+                    }
+                });
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
                     let chosen = g.chosen();
@@ -1359,6 +1538,28 @@ fn game_card(
         ui.ctx().data_mut(|d| d.insert_temp(id, hovered_now));
     }
     action
+}
+
+/// Small flag + code badges for the regions a release is listed in.
+fn region_badges(ui: &mut egui::Ui, p: &theme::Palette, regions: &[Region]) {
+    if regions.is_empty() {
+        return;
+    }
+    ui.add_space(4.0);
+    for &r in regions {
+        egui::Frame::new()
+            .fill(p.control)
+            .corner_radius(6)
+            .inner_margin(egui::Margin { left: 4, right: 6, top: 2, bottom: 2 })
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(18.0, 12.0), egui::Sense::hover());
+                theme::paint_flag(ui.painter(), rect, r);
+                ui.label(RichText::new(r.code()).font(theme::semibold(11.5)).color(p.text_dim));
+            })
+            .response
+            .on_hover_text(format!("Listed in the {} eShop", r.name()));
+    }
 }
 
 /// Result of the optional update / DLC check on a game card.
