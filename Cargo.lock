@@ -597,7 +597,7 @@ dependencies = [
 
 [[package]]
 name = "cartwrite"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "cartwrite-core",
  "eframe",
@@ -610,14 +610,14 @@ dependencies = [
 
 [[package]]
 name = "cartwrite-cli"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "cartwrite-core",
 ]
 
 [[package]]
 name = "cartwrite-core"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "aes",
  "dirs",
