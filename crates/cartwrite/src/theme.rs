@@ -323,6 +323,33 @@ fn install_fonts(ctx: &egui::Context) {
         &[],
     );
 
+    // CJK fallbacks, one list per script. Han characters are shared between the scripts, so the
+    // first font that loads (Japanese) wins for them; Korean and Chinese add what it lacks.
+    #[cfg(target_os = "windows")]
+    let cjk: &[&[&str]] = &[
+        &["C:\\Windows\\Fonts\\YuGothR.ttc", "C:\\Windows\\Fonts\\meiryo.ttc", "C:\\Windows\\Fonts\\msgothic.ttc"],
+        &["C:\\Windows\\Fonts\\malgun.ttf"],
+        &["C:\\Windows\\Fonts\\msyh.ttc", "C:\\Windows\\Fonts\\simsun.ttc"],
+        &["C:\\Windows\\Fonts\\msjh.ttc"],
+    ];
+    #[cfg(target_os = "macos")]
+    let cjk: &[&[&str]] = &[
+        &["/System/Library/Fonts/\u{30d2}\u{30e9}\u{30ae}\u{30ce}\u{89d2}\u{30b4}\u{30b7}\u{30c3}\u{30af} W3.ttc"],
+        &["/System/Library/Fonts/AppleSDGothicNeo.ttc"],
+        &["/System/Library/Fonts/PingFang.ttc"],
+    ];
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let cjk: &[&[&str]] = &[
+        &[
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/OTF/NotoSansCJK-Regular.ttc",
+        ],
+        &["/usr/share/fonts/truetype/wqy/wqy-microhei.ttc", "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf"],
+    ];
+
     let load = |paths: &[&str]| paths.iter().find_map(|p| std::fs::read(p).ok());
     let mut defs = FontDefinitions::default();
     let base: Vec<String> = defs.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
@@ -343,6 +370,14 @@ fn install_fonts(ctx: &egui::Context) {
         fallback.push("ui-symbols".to_string());
     }
 
+    for (i, paths) in cjk.iter().enumerate() {
+        if let Some(bytes) = load(paths) {
+            let name = format!("ui-cjk-{i}");
+            defs.font_data.insert(name.clone(), Arc::new(FontData::from_owned(bytes)));
+            fallback.push(name);
+        }
+    }
+
     let mut proportional = prop.clone();
     proportional.extend(fallback.iter().cloned());
     let mut semibold_family = if strong.is_empty() { prop } else { strong };
@@ -351,9 +386,7 @@ fn install_fonts(ctx: &egui::Context) {
     defs.families.insert(FontFamily::Proportional, proportional);
     defs.families.insert(FontFamily::Name("semibold".into()), semibold_family);
     if let Some(mono) = defs.families.get_mut(&FontFamily::Monospace) {
-        if defs.font_data.contains_key("ui-symbols") {
-            mono.push("ui-symbols".into());
-        }
+        mono.extend(fallback.iter().filter(|n| n.starts_with("ui-")).cloned());
     }
     ctx.set_fonts(defs);
 }
