@@ -181,7 +181,12 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
             let result = extract_game(&keys, &all, &path, &extract_opts, &cancel, &mut print_progress());
             eprintln!();
             match result {
-                Ok(written) => println!("  done in {:.1}s: {:?}", start.elapsed().as_secs_f64(), written),
+                Ok(written) => {
+                    println!("  done in {:.1}s", start.elapsed().as_secs_f64());
+                    for p in written {
+                        println!("  wrote {}", p.display());
+                    }
+                }
                 Err(e) => {
                     eprintln!("  failed: {e}");
                     all_ok = false;

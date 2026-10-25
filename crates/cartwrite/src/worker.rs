@@ -1,4 +1,4 @@
-//! Background threads for scanning inputs and building XCIs.
+//! Background threads for scanning inputs, building XCIs and extracting games.
 //!
 //! Each file / job runs under `catch_unwind`, so a parser panic on a corrupt file is
 //! reported as an error instead of killing the thread and leaving the UI waiting forever.
@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use cartwrite_core::build::{build_xci, BuildOptions, Progress};
+use cartwrite_core::extract::{extract_game, ExtractOptions};
 use cartwrite_core::regions::{self, Region, RegionDb};
 use cartwrite_core::scan::{collect_files, scan_file, Title};
 use cartwrite_core::titledb::{self, TitleDb};
@@ -146,6 +147,52 @@ pub fn spawn_build(
     rx
 }
 
+pub struct ExtractJob {
+    pub application_id: u64,
+    pub titles: Vec<Title>,
+    /// The game folder to create (DLC goes next to it, see [`cartwrite_core::extract::dlc_path`]).
+    pub output: PathBuf,
+    pub opts: ExtractOptions,
+}
+
+/// Extracts one game to a folder. Reports through the same messages as [`spawn_build`].
+pub fn spawn_extract(
+    ctx: eframe::egui::Context,
+    keys: Arc<Keys>,
+    job: ExtractJob,
+    cancel: Arc<AtomicBool>,
+) -> Receiver<BuildMsg> {
+    let (tx, rx) = channel();
+    std::thread::spawn(move || {
+        let id = job.application_id;
+        let _ = tx.send(BuildMsg::Started(id));
+        let refs: Vec<&Title> = job.titles.iter().collect();
+        let mut last = Instant::now();
+        let result = guarded(|| {
+            extract_game(&keys, &refs, &job.output, &job.opts, &cancel, &mut |p| {
+                // The first byte count (0 of the total) always goes through: it tells the UI the
+                // listing is over and the writing has started.
+                let throttle = matches!(p, Progress::Bytes { done, total } if done != total && done != 0);
+                if throttle && last.elapsed().as_millis() < 100 {
+                    return;
+                }
+                last = Instant::now();
+                let _ = tx.send(BuildMsg::Progress(id, p));
+                ctx.request_repaint();
+            })
+        });
+        let msg = match result {
+            Ok(paths) => BuildMsg::Finished(id, Ok(paths)),
+            Err(Error::Cancelled) => BuildMsg::Cancelled(id),
+            Err(e) => BuildMsg::Finished(id, Err(e.to_string())),
+        };
+        let _ = tx.send(msg);
+        let _ = tx.send(BuildMsg::AllDone);
+        ctx.request_repaint();
+    });
+    rx
+}
+
 /// Runs `f`, turning a panic into an error value.
 fn guarded<T, E: FromPanic>(f: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
     match catch_unwind(AssertUnwindSafe(f)) {
@@ -173,6 +220,6 @@ impl FromPanic for String {
 
 impl FromPanic for Error {
     fn from_panic(msg: String) -> Self {
-        Error::Unsupported(format!("internal error while building: {msg}"))
+        Error::Unsupported(format!("internal error: {msg}"))
     }
 }

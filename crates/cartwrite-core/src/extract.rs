@@ -6,14 +6,17 @@
 //! <out>/logo/           boot logo (when present)
 //! <out>/control/        control.nacp and icons
 //! <out>/program<N>/...  the same for each further program of a multi-program title
-//! <out>/dlc/<id>/romfs/ each DLC's data, with its DLC update applied (optional)
+//! <out> DLC/<id>/romfs/ each DLC's data, with its DLC update applied (optional)
 //! ```
+//!
+//! DLC goes to a folder of its own next to the game's, so the game folder only holds the game: tools that look
+//! for the first `romfs` folder inside the one they're given would otherwise find a DLC's.
 //!
 //! An update (or DLC update) replaces the sections it carries and patches the RomFS of the
 //! NCA it updates; sections it doesn't carry come from the base.
 //!
-//! Files are written into `<out>.partial` and the folder is renamed once everything is done,
-//! so a cancelled or failed extraction never leaves a half-written game behind.
+//! Files are written into `<out>.partial` (and `<out> DLC.partial`) and the folders are renamed once everything is
+//! done, so a cancelled or failed extraction never leaves a half-written game behind.
 //!
 //! NSZ/XCZ content works too: each NCZ is first restored to a whole encrypted NCA in
 //! `<out>.cartwrite-tmp` (once, however often it's read), and that folder is removed when the
@@ -46,7 +49,7 @@ const COPY_BUF: usize = 8 << 20;
 
 #[derive(Clone, Debug, Default)]
 pub struct ExtractOptions {
-    /// Also extract each DLC's data into `dlc/<title id>/romfs`.
+    /// Also extract each DLC's data into `<out> DLC/<title id>/romfs` (see [`dlc_path`]).
     pub include_dlc: bool,
     /// Replace `out` if it already holds an earlier extraction.
     pub overwrite: bool,
@@ -93,7 +96,9 @@ struct Part<'a> {
     source: Source<'a>,
     /// [`FS_PFS0`] or [`FS_ROMFS`].
     fs_type: u8,
+    /// Relative to the DLC folder for DLC, else to the game folder.
     dest: PathBuf,
+    dlc: bool,
 }
 
 /// What a part contains, found in the listing pass.
@@ -111,7 +116,8 @@ impl Listing {
     }
 }
 
-/// Extracts the selected titles of one game into the folder `out`. Returns `out`.
+/// Extracts the selected titles of one game into the folder `out`, and their DLC (if asked for) into
+/// [`dlc_path`]`(out)`. Returns the folders written.
 pub fn extract_game(
     keys: &Keys,
     titles: &[&Title],
@@ -119,22 +125,31 @@ pub fn extract_game(
     opts: &ExtractOptions,
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(Progress),
-) -> Result<PathBuf> {
+) -> Result<Vec<PathBuf>> {
     let parts = plan_parts(keys, titles, opts)?;
-    if out.exists() {
-        if !opts.overwrite {
-            return Err(Error::Unsupported(format!("{} already exists", out.display())));
-        }
-        if !looks_like_extraction(out) {
-            return Err(Error::Unsupported(format!(
-                "{} already exists and doesn't look like an extracted game, so it won't be replaced",
-                out.display()
-            )));
+    // The game folder, and the DLC folder when there is DLC to write.
+    let mut outs = vec![out.to_path_buf()];
+    if parts.iter().any(|p| p.dlc) {
+        outs.push(dlc_path(out));
+    }
+    for (o, looks_right) in outs.iter().zip([looks_like_extraction as fn(&Path) -> bool, looks_like_dlc_extraction]) {
+        if o.exists() {
+            if !opts.overwrite {
+                return Err(Error::Unsupported(format!("{} already exists", o.display())));
+            }
+            if !looks_right(o) {
+                return Err(Error::Unsupported(format!(
+                    "{} already exists and doesn't look like an earlier extraction, so it won't be replaced",
+                    o.display()
+                )));
+            }
         }
     }
-    let partial = partial_path(out);
-    if partial.exists() {
-        fs::remove_dir_all(&partial)?;
+    let partials: Vec<PathBuf> = outs.iter().map(|o| partial_path(o)).collect();
+    for partial in &partials {
+        if partial.exists() {
+            fs::remove_dir_all(partial)?;
+        }
     }
     let temp = temp_path(out);
     if temp.exists() {
@@ -158,7 +173,7 @@ pub fn extract_game(
         let mut buf = vec![0u8; COPY_BUF];
         for (p, listing) in parts.iter().zip(&listings) {
             progress(Progress::Log(format!("Extracting {} ({})", p.dest.display(), p.source.label())));
-            let dest = partial.join(&p.dest);
+            let dest = partials[usize::from(p.dlc)].join(&p.dest);
             fs::create_dir_all(&dest)?;
             with_part_data(keys, &cache, &p.source, |s| {
                 let mut copy = |rel: &Path, offset: u64, size: u64| -> Result<()> {
@@ -201,14 +216,18 @@ pub fn extract_game(
     // The restored NCAs are only needed while extracting.
     let _ = fs::remove_dir_all(&temp);
     if let Err(e) = result {
-        let _ = fs::remove_dir_all(&partial);
+        for partial in &partials {
+            let _ = fs::remove_dir_all(partial);
+        }
         return Err(e);
     }
-    if out.exists() {
-        fs::remove_dir_all(out)?;
+    for (partial, o) in partials.iter().zip(&outs) {
+        if o.exists() {
+            fs::remove_dir_all(o)?;
+        }
+        fs::rename(partial, o)?;
     }
-    fs::rename(&partial, out)?;
-    Ok(out.to_path_buf())
+    Ok(outs)
 }
 
 /// Works out which NCA sections go where, checking up front for anything unsupported so
@@ -242,7 +261,7 @@ fn plan_parts<'a>(keys: &Keys, titles: &[&'a Title], opts: &ExtractOptions) -> R
             let header = OpenNca::header(keys, nca)?;
             check_section(&header, 0, nca)?;
             let source = Source::Plain(SectionRef { title: owner, nca, section: 0 });
-            parts.push(Part { source, fs_type: FS_ROMFS, dest: prefix.join("control") });
+            parts.push(Part { source, fs_type: FS_ROMFS, dest: prefix.join("control"), dlc: false });
         }
     }
 
@@ -271,8 +290,12 @@ fn plan_parts<'a>(keys: &Keys, titles: &[&'a Title], opts: &ExtractOptions) -> R
                 )),
                 None => None,
             };
-            let prefix = Path::new("dlc").join(format!("{:016X}", dlc.title_id));
+            let first = parts.len();
+            let prefix = PathBuf::from(format!("{:016X}", dlc.title_id));
             add_nca_parts(keys, &mut parts, Some((dlc, base_data)), up_data, &prefix)?;
+            for p in &mut parts[first..] {
+                p.dlc = true;
+            }
         }
     }
     Ok(parts)
@@ -325,7 +348,7 @@ fn add_nca_parts<'a>(
             } else {
                 Source::Plain(up_ref)
             };
-            parts.push(Part { source, fs_type, dest: prefix.join(dest) });
+            parts.push(Part { source, fs_type, dest: prefix.join(dest), dlc: false });
             done.push(dest);
         }
     }
@@ -338,7 +361,7 @@ fn add_nca_parts<'a>(
             }
             check_section(header, s.index, nca)?;
             let source = Source::Plain(SectionRef { title, nca, section: s.index });
-            parts.push(Part { source, fs_type, dest: prefix.join(dest) });
+            parts.push(Part { source, fs_type, dest: prefix.join(dest), dlc: false });
         }
     }
     Ok(())
@@ -499,6 +522,11 @@ fn open_source(path: &Path) -> Result<File> {
     File::open(path).map_err(|e| Error::File { path: path.to_path_buf(), source: e })
 }
 
+/// The folder the DLC of the game extracted to `out` goes in: `<out> DLC`.
+pub fn dlc_path(out: &Path) -> PathBuf {
+    sibling_path(out, " DLC")
+}
+
 /// Where the extraction is written until it is done: `<out>.partial`.
 fn partial_path(out: &Path) -> PathBuf {
     sibling_path(out, ".partial")
@@ -593,6 +621,21 @@ fn restore_ncz(n: &NcaRef, path: &Path, cancel: &AtomicBool) -> Result<()> {
 /// can't wipe an unrelated folder the user pointed at by mistake.
 fn looks_like_extraction(dir: &Path) -> bool {
     ["exefs", "romfs", "control"].iter().any(|d| dir.join(d).is_dir())
+}
+
+/// The same for a DLC folder: nothing but `<title id>/romfs` folders.
+fn looks_like_dlc_extraction(dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else { return false };
+    let mut any = false;
+    for e in entries {
+        let Ok(e) = e else { return false };
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.len() != 16 || !name.bytes().all(|b| b.is_ascii_hexdigit()) || !e.path().join("romfs").is_dir() {
+            return false;
+        }
+        any = true;
+    }
+    any
 }
 
 fn check_cancel(cancel: &AtomicBool) -> Result<()> {
@@ -841,7 +884,7 @@ mod tests {
             Progress::Log(message) => logs.push(message),
         };
         let result = extract_game(&keys, &selected, &out, &opts, &never, &mut progress).expect("extracting");
-        assert_eq!(result, out);
+        assert_eq!(result, std::slice::from_ref(&out));
         assert_extraction(&out, &files, &dirs);
         assert!(!partial.exists(), "{} was left behind", partial.display());
         assert!(!temp.exists(), "{} was left behind", temp.display());
@@ -1136,7 +1179,7 @@ mod tests {
         };
         let opts = ExtractOptions::default();
         let result = extract_game(&keys, &selected, &out, &opts, &never, &mut progress).expect("extracting");
-        assert_eq!(result, out);
+        assert_eq!(result, std::slice::from_ref(&out));
         assert_extraction(&out, &files, &dirs);
         assert!(!partial_path(&out).exists());
         assert!(!temp_path(&out).exists());
@@ -1202,7 +1245,7 @@ mod tests {
         };
         let opts = ExtractOptions::default();
         let result = extract_game(keys, &selected, &out, &opts, &never, &mut progress).expect("extracting");
-        assert_eq!(result, out);
+        assert_eq!(result, std::slice::from_ref(&out));
         assert!(!partial_path(&out).exists());
         (out, last_bytes)
     }
@@ -1839,14 +1882,19 @@ mod tests {
         DlcGame { base_nsp, dlc_nsp, update_nsp, base_files: base.files, dlc_romfs, new_dlc_romfs }
     }
 
-    /// The files extraction must produce: the base game's, and a DLC's RomFS under `dlc/<DLC id>/romfs`.
-    fn with_dlc_romfs(
+    /// Checks an extraction with DLC: `game` holds the base game's files alone, and the DLC folder next to it the
+    /// DLC's RomFS under `<DLC id>/romfs`.
+    fn assert_dlc_extraction(
+        written: &[PathBuf],
         base_files: &BTreeMap<String, Vec<u8>>,
         dlc_romfs: &[(&str, Vec<u8>)],
-    ) -> BTreeMap<String, Vec<u8>> {
-        let mut files = base_files.clone();
-        files.extend(expected(&[(&format!("dlc/{DLC_ID:016X}/romfs"), dlc_romfs)]));
-        files
+    ) {
+        let [game, dlc] = written else { panic!("wrote {written:?}, not a game folder and a DLC folder") };
+        assert_eq!(*dlc, dlc_path(game));
+        assert_extraction(game, base_files, &implied_dirs(base_files, &[]));
+        let dlc_files = expected(&[(&format!("{DLC_ID:016X}/romfs"), dlc_romfs)]);
+        assert_extraction(dlc, &dlc_files, &implied_dirs(&dlc_files, &[]));
+        assert!(!partial_path(game).exists() && !partial_path(dlc).exists());
     }
 
     /// The game made of the NSPs of `g`, as the scan and grouping find it: one game of a base, a DLC and a DLC update.
@@ -1874,13 +1922,14 @@ mod tests {
         kinds: &[TitleKind],
         include_dlc: bool,
         out: &Path,
-    ) -> Result<PathBuf> {
+    ) -> Result<Vec<PathBuf>> {
         let selected: Vec<&Title> = game.titles.iter().filter(|t| kinds.contains(&t.kind)).collect();
         let opts = ExtractOptions { include_dlc, ..Default::default() };
         extract_game(keys, &selected, out, &opts, &AtomicBool::new(false), &mut |_| {})
     }
 
-    /// A DLC update that patches the DLC's RomFS: with DLC extraction on, `dlc/<DLC id>/romfs` is the patched tree.
+    /// A DLC update that patches the DLC's RomFS: with DLC extraction on, `<out> DLC/<DLC id>/romfs` is the patched
+    /// tree.
     /// Without its DLC the update can't be applied, which is an error; with DLC extraction off, the DLC titles,
     /// updates included, are left out.
     #[test]
@@ -1897,15 +1946,32 @@ mod tests {
         );
 
         // The DLC with its update: the patched tree, and nothing of the DLC's own that the update dropped.
-        let files = with_dlc_romfs(&g.base_files, &g.new_dlc_romfs);
-        let out = extract_kinds(&keys, &game, &all, true, &out_root.join("patched")).expect("extracting");
-        assert_extraction(&out, &files, &implied_dirs(&files, &[]));
-        assert!(!out.join("dlc").join(format!("{DLC_ID:016X}")).join("romfs/levels/two.txt").exists());
+        let written = extract_kinds(&keys, &game, &all, true, &out_root.join("patched")).expect("extracting");
+        assert_dlc_extraction(&written, &g.base_files, &g.new_dlc_romfs);
 
         // The DLC alone: its RomFS as it is.
-        let files = with_dlc_romfs(&g.base_files, &g.dlc_romfs);
-        let out = extract_kinds(&keys, &game, &base_and_dlc, true, &out_root.join("unpatched")).expect("extracting");
-        assert_extraction(&out, &files, &implied_dirs(&files, &[]));
+        let written =
+            extract_kinds(&keys, &game, &base_and_dlc, true, &out_root.join("unpatched")).expect("extracting");
+        assert_dlc_extraction(&written, &g.base_files, &g.dlc_romfs);
+
+        // Extracting again replaces the DLC folder only on request, and only if it looks like an earlier one.
+        let game_dir = out_root.join("unpatched");
+        let err = extract_kinds(&keys, &game, &base_and_dlc, true, &game_dir).expect_err("overwrote without asking");
+        assert!(matches!(&err, Error::Unsupported(m) if m.contains("already exists")), "{err}");
+        fs::remove_dir_all(&game_dir).unwrap();
+        let err = extract_kinds(&keys, &game, &base_and_dlc, true, &game_dir).expect_err("overwrote the DLC folder");
+        assert!(err.to_string().contains(&dlc_path(&game_dir).display().to_string()), "{err}");
+        fs::write(dlc_path(&game_dir).join("notes.txt"), b"mine").unwrap();
+        let selected: Vec<&Title> = game.titles.iter().filter(|t| base_and_dlc.contains(&t.kind)).collect();
+        let overwrite = ExtractOptions { include_dlc: true, overwrite: true };
+        let err = extract_game(&keys, &selected, &game_dir, &overwrite, &AtomicBool::new(false), &mut |_| {})
+            .expect_err("replaced a folder that isn't an extraction");
+        assert!(matches!(&err, Error::Unsupported(m) if m.contains("doesn't look like")), "{err}");
+        assert!(dlc_path(&game_dir).join("notes.txt").exists());
+        fs::remove_file(dlc_path(&game_dir).join("notes.txt")).unwrap();
+        let written = extract_game(&keys, &selected, &game_dir, &overwrite, &AtomicBool::new(false), &mut |_| {})
+            .expect("overwriting");
+        assert_dlc_extraction(&written, &g.base_files, &g.dlc_romfs);
 
         // The update without its DLC.
         let out = out_root.join("orphan");
@@ -1913,12 +1979,15 @@ mod tests {
         assert!(matches!(&err, Error::Unsupported(m) if m.contains("without the DLC it updates")), "{err}");
         assert!(err.to_string().contains(&format!("{DLC_ID:016X}")), "{err}");
         assert!(!out.exists() && !partial_path(&out).exists() && !temp_path(&out).exists());
+        assert!(!dlc_path(&out).exists() && !partial_path(&dlc_path(&out)).exists());
 
         // DLC extraction off: no DLC folder, whatever DLC titles are selected, and no complaint about the update.
         for (name, kinds) in [("all", &all[..]), ("update only", &base_and_update[..]), ("dlc only", &base_and_dlc[..])]
         {
-            let out = extract_kinds(&keys, &game, kinds, false, &out_root.join(format!("no dlc, {name}"))).expect(name);
+            let out = out_root.join(format!("no dlc, {name}"));
+            assert_eq!(extract_kinds(&keys, &game, kinds, false, &out).expect(name), std::slice::from_ref(&out));
             assert_extraction(&out, &g.base_files, &implied_dirs(&g.base_files, &[]));
+            assert!(!dlc_path(&out).exists());
         }
     }
 
@@ -1930,10 +1999,8 @@ mod tests {
         let g = write_dlc_game(&keys, &tmp.path().join("in"), false);
         let game = group_dlc_game(&keys, &g);
 
-        let files = with_dlc_romfs(&g.base_files, &g.new_dlc_romfs);
         let all = [TitleKind::Base, TitleKind::Dlc, TitleKind::DlcUpdate];
-        let out = extract_kinds(&keys, &game, &all, true, &tmp.path().join("out")).expect("extracting");
-        assert_extraction(&out, &files, &implied_dirs(&files, &[]));
-        assert!(!out.join("dlc").join(format!("{DLC_ID:016X}")).join("romfs/levels/two.txt").exists());
+        let written = extract_kinds(&keys, &game, &all, true, &tmp.path().join("out")).expect("extracting");
+        assert_dlc_extraction(&written, &g.base_files, &g.new_dlc_romfs);
     }
 }

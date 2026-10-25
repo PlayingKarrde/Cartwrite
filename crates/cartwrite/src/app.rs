@@ -7,6 +7,7 @@ use std::time::Instant;
 
 use cartwrite_core::build::{BuildOptions, Progress};
 use cartwrite_core::container::ContainerKind;
+use cartwrite_core::extract::{dlc_path, ExtractOptions};
 use cartwrite_core::plan::{group, output_stem, Game};
 use cartwrite_core::regions::{self, Region, RegionDb};
 use cartwrite_core::rsv::format_rsv;
@@ -18,7 +19,8 @@ use eframe::egui::{self, Color32, RichText};
 
 use crate::theme::{self, ThemeChoice, ThemeStyle};
 use crate::worker::{
-    spawn_build, spawn_regions, spawn_scan, spawn_titledb, BuildJob, BuildMsg, RegionMsg, ScanMsg, TitleDbResult,
+    spawn_build, spawn_extract, spawn_regions, spawn_scan, spawn_titledb, BuildJob, BuildMsg, ExtractJob, RegionMsg,
+    ScanMsg, TitleDbResult,
 };
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -42,6 +44,10 @@ struct Settings {
     show_regions: bool,
     /// URL or local folder of titledb's per-country lists.
     regions_source: String,
+    /// Last folder a game was extracted into.
+    extract_dir: Option<PathBuf>,
+    /// Last "Game only" / "Game + DLC" choice for extracting.
+    extract_dlc: bool,
 }
 
 impl Default for Settings {
@@ -60,6 +66,31 @@ impl Default for Settings {
             titledb_source: titledb::DEFAULT_SOURCE.into(),
             show_regions: false,
             regions_source: regions::DEFAULT_SOURCE.into(),
+            extract_dir: None,
+            extract_dlc: false,
+        }
+    }
+}
+
+/// What a running job does with a game.
+#[derive(Clone, Copy, PartialEq)]
+enum JobKind {
+    Build,
+    Extract,
+}
+
+impl JobKind {
+    fn doing(self) -> &'static str {
+        match self {
+            Self::Build => "Building",
+            Self::Extract => "Extracting",
+        }
+    }
+
+    fn done(self) -> &'static str {
+        match self {
+            Self::Build => "Built",
+            Self::Extract => "Extracted",
         }
     }
 }
@@ -68,8 +99,8 @@ impl Default for Settings {
 enum Status {
     Ready,
     Queued,
-    Building { done: u64, total: u64 },
-    Done(Vec<PathBuf>),
+    Building { kind: JobKind, done: u64, total: u64 },
+    Done(JobKind, Vec<PathBuf>),
     Failed(String),
 }
 
@@ -90,15 +121,49 @@ impl GameView {
     fn file_stem(&self) -> String {
         output_stem(&self.game.name, self.game.application_id, &self.chosen())
     }
+
+    /// Extraction needs a base game.
+    fn has_base(&self) -> bool {
+        self.chosen().iter().any(|t| t.kind == TitleKind::Base)
+    }
+
+    fn has_dlc(&self) -> bool {
+        self.chosen().iter().any(|t| matches!(t.kind, TitleKind::Dlc | TitleKind::DlcUpdate))
+    }
+
+    /// The titles an extraction reads: DLC only when it was asked for.
+    fn extract_titles(&self, with_dlc: bool) -> Vec<&Title> {
+        self.chosen()
+            .into_iter()
+            .filter(|t| with_dlc || matches!(t.kind, TitleKind::Base | TitleKind::Update))
+            .collect()
+    }
+
+    /// Name of the folder an extraction is written to (same as the command line's).
+    fn extract_stem(&self, with_dlc: bool) -> String {
+        output_stem(&self.game.name, self.game.application_id, &self.extract_titles(with_dlc))
+    }
 }
 
 struct Job {
+    kind: JobKind,
     rx: Receiver<BuildMsg>,
     cancel: Arc<AtomicBool>,
     started: Instant,
     current: Option<u64>,
     bytes_before: u64,
     bytes_total: u64,
+    /// When the first byte count of an extraction arrived. Listing and decompressing come
+    /// first, so speed and time left are measured from here rather than from `started`.
+    bytes_started: Option<Instant>,
+}
+
+/// The "Extract to folder" dialog.
+struct ExtractDialog {
+    application_id: u64,
+    /// Folder the game folder is created in.
+    dir: PathBuf,
+    with_dlc: bool,
 }
 
 pub struct App {
@@ -113,6 +178,7 @@ pub struct App {
     job: Option<Job>,
     log: Vec<(Instant, String, bool)>,
     show_settings: bool,
+    extract_dialog: Option<ExtractDialog>,
     show_log: bool,
     pending_rescan: bool,
     scanned: HashSet<PathBuf>,
@@ -157,6 +223,10 @@ struct DebugHooks {
     titledb: Option<String>,
     /// `CARTWRITE_DEBUG_REGIONS=1` turns the region lookup on; any other value is used as its source.
     regions: Option<String>,
+    /// `CARTWRITE_DEBUG_EXTRACT`: open the extract dialog for the first game once the scan is done
+    /// (`=<folder>` instead extracts that game, without DLC, into the folder).
+    extract: bool,
+    extract_to: Option<PathBuf>,
     // `CARTWRITE_DEBUG_THEME=light` is applied in `App::new` without touching saved settings.
 }
 
@@ -169,6 +239,8 @@ impl DebugHooks {
             scroll_to_updates: std::env::var("CARTWRITE_DEBUG_SETTINGS").as_deref() == Ok("updates"),
             titledb: std::env::var("CARTWRITE_DEBUG_TITLEDB").ok(),
             regions: std::env::var("CARTWRITE_DEBUG_REGIONS").ok(),
+            extract: std::env::var_os("CARTWRITE_DEBUG_EXTRACT").is_some(),
+            extract_to: std::env::var_os("CARTWRITE_DEBUG_EXTRACT").filter(|v| v != "1").map(PathBuf::from),
         }
     }
 }
@@ -193,6 +265,7 @@ impl App {
             job: None,
             log: Vec::new(),
             show_settings: false,
+            extract_dialog: None,
             show_log: false,
             pending_rescan: false,
             scanned: HashSet::new(),
@@ -395,7 +468,7 @@ impl App {
                         game,
                         selected: prev.selected,
                         excluded: prev.excluded,
-                        status: if matches!(prev.status, Status::Done(_) | Status::Failed(_)) {
+                        status: if matches!(prev.status, Status::Done(..) | Status::Failed(_)) {
                             Status::Ready
                         } else {
                             prev.status
@@ -458,6 +531,7 @@ impl App {
         }
 
         let Some(job) = &mut self.job else { return };
+        let kind = job.kind;
         let mut msgs = Vec::new();
         loop {
             match job.rx.try_recv() {
@@ -476,11 +550,18 @@ impl App {
                         job.current = Some(id);
                     }
                     let name = self.game_name(id);
-                    self.log(format!("Building {name}"), false);
-                    self.set_status(id, Status::Building { done: 0, total: 1 });
+                    self.log(format!("{} {name}", kind.doing()), false);
+                    self.set_status(id, Status::Building { kind, done: 0, total: 1 });
                 }
                 BuildMsg::Progress(id, Progress::Bytes { done, total }) => {
-                    self.set_status(id, Status::Building { done, total })
+                    if let Some(job) = &mut self.job {
+                        // An extraction has exactly one game, and its real size is only known now.
+                        if kind == JobKind::Extract {
+                            job.bytes_total = total;
+                            job.bytes_started.get_or_insert_with(Instant::now);
+                        }
+                    }
+                    self.set_status(id, Status::Building { kind, done, total })
                 }
                 BuildMsg::Progress(_, Progress::Log(msg)) => self.log(msg, false),
                 BuildMsg::Finished(id, r) => {
@@ -496,7 +577,7 @@ impl App {
                             for p in &paths {
                                 self.log(format!("✔ Wrote {}", p.display()), false);
                             }
-                            self.set_status(id, Status::Done(paths));
+                            self.set_status(id, Status::Done(kind, paths));
                         }
                         Err(e) => {
                             let name = self.game_name(id);
@@ -582,7 +663,48 @@ impl App {
         };
         let cancel = Arc::new(AtomicBool::new(false));
         let rx = spawn_build(ctx.clone(), keys, jobs, opts, cancel.clone());
-        self.job = Some(Job { rx, cancel, started: Instant::now(), current: None, bytes_before: 0, bytes_total });
+        self.job = Some(Job {
+            kind: JobKind::Build,
+            rx,
+            cancel,
+            started: Instant::now(),
+            current: None,
+            bytes_before: 0,
+            bytes_total,
+            bytes_started: None,
+        });
+    }
+
+    /// Opens the extract dialog for a game, starting from the last choices.
+    fn open_extract_dialog(&mut self, id: u64) {
+        let Some(g) = self.games.iter().find(|g| g.game.application_id == id) else { return };
+        let dir = self.settings.extract_dir.clone().unwrap_or_else(|| self.output_dir_for(g));
+        let with_dlc = self.settings.extract_dlc && g.has_dlc();
+        self.extract_dialog = Some(ExtractDialog { application_id: id, dir, with_dlc });
+    }
+
+    /// Extracts one game to the folder `output`.
+    fn start_extract(&mut self, ctx: &egui::Context, id: u64, output: PathBuf, opts: ExtractOptions) {
+        let Some(keys) = self.keys.clone() else { return };
+        let Some(g) = self.games.iter_mut().find(|g| g.game.application_id == id) else { return };
+        let titles: Vec<Title> = g.chosen().into_iter().cloned().collect();
+        if titles.is_empty() {
+            return;
+        }
+        g.status = Status::Queued;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let job = ExtractJob { application_id: id, titles, output, opts };
+        let rx = spawn_extract(ctx.clone(), keys, job, cancel.clone());
+        self.job = Some(Job {
+            kind: JobKind::Extract,
+            rx,
+            cancel,
+            started: Instant::now(),
+            current: None,
+            bytes_before: 0,
+            bytes_total: 0,
+            bytes_started: None,
+        });
     }
 
     /// Source XCIs that are safe to delete after rebuilding `g`: every title they hold must
@@ -711,14 +833,17 @@ impl App {
                 Some(Status::Building { done, .. }) => *done,
                 _ => 0,
             };
+            // An extraction only knows its size once it starts writing.
+            let preparing = job.kind == JobKind::Extract && job.bytes_total == 0;
             let total = job.bytes_total.max(1);
             let done = (job.bytes_before + cur_done).min(total);
-            let secs = job.started.elapsed().as_secs_f64().max(0.001);
+            let since = job.bytes_started.unwrap_or(job.started);
+            let secs = since.elapsed().as_secs_f64().max(0.001);
             let speed = done as f64 / secs;
             let eta = if speed > 0.0 { total.saturating_sub(done) as f64 / speed } else { 0.0 };
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.label(RichText::new("Building").color(p.text_dim));
+                ui.label(RichText::new(job.kind.doing()).color(p.text_dim));
                 ui.label(
                     RichText::new(current.map(|g| g.game.name.as_str()).unwrap_or("…")).font(theme::semibold(14.0)),
                 );
@@ -726,20 +851,23 @@ impl App {
                     if theme::ghost_button(ui, true, "Cancel").clicked() {
                         job.cancel.store(true, Ordering::Relaxed);
                     }
-                    ui.label(
-                        RichText::new(format!(
+                    let text = if preparing {
+                        "Preparing…".to_string()
+                    } else {
+                        format!(
                             "{} of {}  ·  {}/s  ·  {} left",
                             format_size(done),
                             format_size(total),
                             format_size(speed as u64),
                             fmt_secs(eta)
-                        ))
-                        .color(p.text_dim),
-                    );
+                        )
+                    };
+                    ui.label(RichText::new(text).color(p.text_dim));
                 });
             });
             let w = ui.available_width();
-            theme::progress_bar(ui, egui::Id::new("overall"), done as f32 / total as f32, w);
+            let fraction = if preparing { 0.0 } else { done as f32 / total as f32 };
+            theme::progress_bar(ui, egui::Id::new("overall"), fraction, w);
             ui.add_space(10.0);
         }
 
@@ -934,6 +1062,7 @@ impl App {
         let titledb = self.active_titledb();
         let region_db = self.active_regions();
         let mut build_one = None;
+        let mut extract_one = None;
         let mut remove = None;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             for (i, g) in self.games.iter_mut().enumerate() {
@@ -946,6 +1075,7 @@ impl App {
                 match game_card(ui, g, job_running, &dir, deltas, titledb.as_deref(), region_db.as_deref()) {
                     CardAction::None => {}
                     CardAction::Build => build_one = Some(g.game.application_id),
+                    CardAction::Extract => extract_one = Some(g.game.application_id),
                     CardAction::Remove => remove = Some(i),
                 }
                 ui.add_space(10.0);
@@ -957,6 +1087,9 @@ impl App {
         });
         if let Some(id) = build_one {
             self.start_build(ui.ctx(), Some(id));
+        }
+        if let Some(id) = extract_one {
+            self.open_extract_dialog(id);
         }
         if let Some(i) = remove {
             let g = self.games.remove(i);
@@ -1098,14 +1231,8 @@ impl App {
         let mut reload = false;
         let mut titledb_action: Option<bool> = None; // Some(force) to (re)load the database
         let mut regions_action: Option<bool> = None;
-        let frame = egui::Frame::new()
-            .fill(p.panel)
-            .stroke(egui::Stroke::new(1.0, p.border))
-            .corner_radius(16)
-            .inner_margin(24)
-            .shadow(egui::epaint::Shadow { offset: [0, 16], blur: 48, spread: 0, color: p.shadow });
         let max_h = (ctx.content_rect().height() - 120.0).max(200.0);
-        let modal = egui::Modal::new(egui::Id::new("settings")).frame(frame).show(ctx, |ui| {
+        let modal = egui::Modal::new(egui::Id::new("settings")).frame(modal_frame(&p)).show(ctx, |ui| {
             ui.set_width(520.0);
             ui.set_max_width(520.0);
             egui::ScrollArea::vertical().max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
@@ -1248,6 +1375,134 @@ impl App {
             }
         }
     }
+
+    fn extract_modal(&mut self, ctx: &egui::Context) {
+        let Some(mut dlg) = self.extract_dialog.take() else { return };
+        // The game was removed or regrouped away while the dialog was open: close it.
+        let Some(g) = self.games.iter().find(|g| g.game.application_id == dlg.application_id) else { return };
+        let p = theme::palette_for(theme::style(), ctx.theme() == egui::Theme::Dark);
+        let can_start = self.keys.is_some() && !self.busy();
+        let has_dlc = g.has_dlc();
+        if !has_dlc {
+            dlg.with_dlc = false;
+        }
+        let mut close = false;
+        let mut start = false;
+        let modal = egui::Modal::new(egui::Id::new("extract")).frame(modal_frame(&p)).show(ctx, |ui| {
+            ui.set_width(460.0);
+            ui.set_max_width(460.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Extract to folder").font(theme::semibold(20.0)));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::icon_button(ui, true, "✕", "Close").clicked() {
+                        close = true;
+                    }
+                });
+            });
+            ui.add_space(8.0);
+            ui.label(RichText::new(&g.game.name).font(theme::semibold(15.0)));
+            ui.label(
+                RichText::new("Writes the game's files with its update applied: exefs, romfs, control and logo.")
+                    .size(12.0)
+                    .color(p.text_dim),
+            );
+
+            section(ui, "CONTENT");
+            if has_dlc {
+                theme::segmented(ui, &mut dlg.with_dlc, &[(false, "Game only"), (true, "Game + DLC")]);
+                if dlg.with_dlc {
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(
+                            "DLC goes to a separate folder next to the game's, as <title id>/romfs, with its DLC                              update applied.",
+                        )
+                        .size(12.0)
+                        .color(p.text_dim),
+                    );
+                }
+            } else {
+                ui.label(RichText::new("No DLC selected for this game.").size(12.0).color(p.text_dim));
+            }
+
+            section(ui, "DESTINATION");
+            let label = format!("{}  ⏷", short_path(&dlg.dir, 40));
+            if theme::secondary_button(ui, true, label).on_hover_text(dlg.dir.display().to_string()).clicked() {
+                if let Some(d) = rfd::FileDialog::new().set_directory(&dlg.dir).pick_folder() {
+                    dlg.dir = d;
+                }
+            }
+            let stem = g.extract_stem(dlg.with_dlc);
+            let target = dlg.dir.join(&stem);
+            ui.add_space(4.0);
+            ui.add(egui::Label::new(RichText::new(format!("→  {stem}")).size(12.5).color(p.text_dim)).truncate())
+                .on_hover_text(target.display().to_string());
+            let dlc_target = dlc_path(&target);
+            if dlg.with_dlc {
+                let name = dlc_target.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                ui.add(egui::Label::new(RichText::new(format!("→  {name}")).size(12.5).color(p.text_dim)).truncate())
+                    .on_hover_text(dlc_target.display().to_string());
+            }
+
+            let exists = target.exists() || (dlg.with_dlc && dlc_target.exists());
+            if exists {
+                ui.add_space(8.0);
+                let msg = if dlg.with_dlc {
+                    "An earlier extraction is already there. Extracting replaces it."
+                } else {
+                    "This folder already exists. Extracting replaces it."
+                };
+                ui.label(RichText::new(msg).color(p.warn));
+            }
+            let compressed = g.extract_titles(dlg.with_dlc).iter().any(|t| {
+                let ext = t.source.extension().map(|e| e.to_string_lossy().to_ascii_lowercase());
+                matches!(ext.as_deref(), Some("nsz" | "xcz"))
+            });
+            if compressed {
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(
+                        "Compressed input is decompressed to a temporary folder next to the output first, \
+                         so it needs extra free space.",
+                    )
+                    .size(12.0)
+                    .color(p.text_dim),
+                );
+            }
+
+            ui.add_space(14.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let text = if exists { "   Replace   " } else { "   Extract   " };
+                if theme::primary_button(ui, can_start, text).clicked() {
+                    start = true;
+                }
+                if theme::ghost_button(ui, true, "Cancel").clicked() {
+                    close = true;
+                }
+            });
+        });
+        if start {
+            let output = dlg.dir.join(g.extract_stem(dlg.with_dlc));
+            let exists = output.exists() || (dlg.with_dlc && dlc_path(&output).exists());
+            let opts = ExtractOptions { include_dlc: dlg.with_dlc, overwrite: exists };
+            self.settings.extract_dir = Some(dlg.dir.clone());
+            if has_dlc {
+                self.settings.extract_dlc = dlg.with_dlc;
+            }
+            self.start_extract(ctx, dlg.application_id, output, opts);
+        } else if !(close || modal.should_close()) {
+            self.extract_dialog = Some(dlg);
+        }
+    }
+}
+
+/// Frame shared by the modal dialogs.
+fn modal_frame(p: &theme::Palette) -> egui::Frame {
+    egui::Frame::new()
+        .fill(p.panel)
+        .stroke(egui::Stroke::new(1.0, p.border))
+        .corner_radius(16)
+        .inner_margin(24)
+        .shadow(egui::epaint::Shadow { offset: [0, 16], blur: 48, spread: 0, color: p.shadow })
 }
 
 fn section(ui: &mut egui::Ui, title: &str) {
@@ -1302,6 +1557,7 @@ fn short_path(p: &Path, max: usize) -> String {
 enum CardAction {
     None,
     Build,
+    Extract,
     Remove,
 }
 
@@ -1311,6 +1567,12 @@ fn kind_color(p: &theme::Palette, kind: TitleKind) -> Color32 {
         TitleKind::Update => p.info,
         TitleKind::Dlc | TitleKind::DlcUpdate => p.dlc,
     }
+}
+
+/// The "Extract…" button on a game card. Returns true when clicked.
+fn extract_button(ui: &mut egui::Ui, busy: bool, has_base: bool) -> bool {
+    let tip = if has_base { "Extract the game, with its update applied, to a folder" } else { "Needs the base game" };
+    theme::secondary_button(ui, !busy && has_base, "Extract…").on_hover_text(tip).on_disabled_hover_text(tip).clicked()
 }
 
 fn game_card(
@@ -1426,8 +1688,9 @@ fn game_card(
                     action = CardAction::Remove;
                 }
                 let can_build = !busy && !g.chosen().is_empty();
+                let has_base = g.has_base();
                 match &g.status {
-                    Status::Done(paths) => {
+                    Status::Done(kind, paths) => {
                         if let Some(path) = paths.first() {
                             if theme::secondary_button(ui, true, "Show in folder")
                                 .on_hover_text(path.display().to_string())
@@ -1436,11 +1699,14 @@ fn game_card(
                                 reveal(path);
                             }
                         }
-                        status_pill(ui, p.ok, "Built");
+                        if extract_button(ui, busy, has_base) {
+                            action = CardAction::Extract;
+                        }
+                        status_pill(ui, p.ok, kind.done());
                     }
-                    Status::Building { done, total } => {
+                    Status::Building { kind, done, total } => {
                         let pct = *done as f32 / (*total).max(1) as f32 * 100.0;
-                        status_pill(ui, p.accent, &format!("Building {pct:.0}%"));
+                        status_pill(ui, p.accent, &format!("{} {pct:.0}%", kind.doing()));
                     }
                     Status::Queued => {
                         status_pill(ui, p.text_dim, "Queued");
@@ -1449,18 +1715,24 @@ fn game_card(
                         if theme::secondary_button(ui, can_build, "Retry").clicked() {
                             action = CardAction::Build;
                         }
+                        if extract_button(ui, busy, has_base) {
+                            action = CardAction::Extract;
+                        }
                         status_pill(ui, p.err, "Failed").on_hover_text(e);
                     }
                     Status::Ready => {
                         if theme::secondary_button(ui, can_build, "Build").clicked() {
                             action = CardAction::Build;
                         }
+                        if extract_button(ui, busy, has_base) {
+                            action = CardAction::Extract;
+                        }
                     }
                 }
             });
         });
 
-        if let Status::Building { done, total } = g.status {
+        if let Status::Building { done, total, .. } = g.status {
             ui.add_space(10.0);
             let w = ui.available_width();
             theme::progress_bar(ui, id.with("bar"), done as f32 / total.max(1) as f32, w);
@@ -1743,6 +2015,17 @@ impl eframe::App for App {
         if self.debug.auto_build && ctx.cumulative_frame_nr() == 40 && !self.busy() {
             self.start_build(ctx, None);
         }
+        if self.debug.extract && !self.games.is_empty() && self.scan_rx.is_none() {
+            self.debug.extract = false;
+            let id = self.games[0].game.application_id;
+            match self.debug.extract_to.take() {
+                Some(dir) => {
+                    let output = dir.join(self.games[0].extract_stem(false));
+                    self.start_extract(ctx, id, output, ExtractOptions::default());
+                }
+                None => self.open_extract_dialog(id),
+            }
+        }
 
         // Drag & drop.
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
@@ -1782,6 +2065,9 @@ impl eframe::App for App {
         if self.show_settings {
             self.settings_modal(ctx);
         }
+        if self.extract_dialog.is_some() {
+            self.extract_modal(ctx);
+        }
 
         if hovering && !self.games.is_empty() {
             let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("drop")));
@@ -1812,6 +2098,20 @@ impl eframe::App for App {
             return; // debug runs mustn't change the user's saved settings
         }
         eframe::set_value(storage, eframe::APP_KEY, &self.settings);
+    }
+
+    /// Cancels a running build or extraction and gives it a moment to remove its partial output
+    /// (and the temporary files of compressed input), which would otherwise be left on disk.
+    fn on_exit(&mut self) {
+        let Some(job) = self.job.take() else { return };
+        job.cancel.store(true, Ordering::Relaxed);
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            match job.rx.recv_timeout(left) {
+                Ok(BuildMsg::AllDone) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
     }
 }
 

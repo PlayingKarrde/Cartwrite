@@ -21,6 +21,8 @@ it.
 - Can lower the required system version so the game doesn't ask for a system update it doesn't
   need (see [Options](#options)).
 - Can split output into 4 GB parts for FAT32 SD cards.
+- Can also extract a game to a folder with its update applied (exefs, romfs and control), and
+  optionally each DLC's data to a folder next to it, for modding, emulators or recompilations.
 - Optional check for newer updates and missing DLC against a title database you choose. Off by
   default.
 - Optional region badges (US, EU, JP, Asia, KR) showing which eShop each release comes from.
@@ -84,6 +86,36 @@ Open **Contents** on a game card to see every title that was found, with its ver
 required firmware and source file. Untick a row to leave it out of the build.
 
 ![Contents list](docs/screenshots/contents.png)
+
+### Extract a game to a folder
+
+1. Click **Extract…** on the game card.
+2. Choose **Game only** or **Game + DLC**. The choice is only offered when the game has DLC.
+3. Pick the destination and click **Extract**.
+
+The game is written to its own folder inside the destination, named like the XCI would be. DLC
+goes to a second folder next to it, so the game folder only ever holds the game itself:
+
+```
+<name>/exefs/              main, main.npdm, rtld, sdk, subsdk*
+<name>/romfs/              game data
+<name>/logo/               boot logo (when present)
+<name>/control/            control.nacp and icons
+<name>/program<N>/...      the same for each further program of a multi-program title
+<name> DLC/<id>/romfs/     each DLC's data, with its DLC update applied (Game + DLC only)
+```
+
+Point tools such as recompilations at `<name>`, the folder that holds `exefs` and `romfs`.
+
+- The update's RomFS patch is applied to the base game, so `romfs/` is the game as the console
+  sees it.
+- A base game is required. Without one, the **Extract…** button is greyed out.
+- NSZ and XCZ input is decompressed to a temporary folder first, so you need some extra disk
+  space while it runs. The temporary folder is removed afterwards.
+- A cancelled or failed extraction leaves nothing behind. Files go into `<name>.partial` until
+  everything is written.
+- If the folders already exist, the button reads **Replace**. Cartwrite only replaces folders
+  that are an earlier extraction.
 
 ### Check for newer updates and missing DLC
 
@@ -190,6 +222,7 @@ Settings are in the gear menu. The most used ones are also at the bottom of the 
 cartwrite-cli info  [--regions | --regions-from URL|DIR] <files or folders...>
 cartwrite-cli check [--titledb URL|FILE] [--refresh] <files or folders...>
 cartwrite-cli build [-o DIR] [--no-rsv] [--fat32] [--deltas] [--keys FILE] <files or folders...>
+cartwrite-cli extract [-o DIR] [--with-dlc] [--overwrite] [--keys FILE] <files or folders...>
 ```
 
 - `info` lists every game found, with each title's version, size, required firmware and source.
@@ -202,9 +235,12 @@ cartwrite-cli build [-o DIR] [--no-rsv] [--fat32] [--deltas] [--keys FILE] <file
 - `--no-rsv` turns off lowering the required firmware.
 - `--fat32` splits large files into 4 GB parts.
 - `--deltas` keeps update delta fragments.
+- `extract` writes one folder per game into `DIR` (default `output`). `--with-dlc` also
+  extracts DLC, into a `<name> DLC` folder next to the game's. `--overwrite` replaces an
+  earlier extraction.
 - `--keys` points at a specific `prod.keys`.
 
-The exit code is non-zero if any game failed to build.
+The exit code is non-zero if any game failed.
 
 ## Building from source
 
@@ -241,8 +277,10 @@ cargo test --workspace
 
 - NCA2 and older content from the Switch's earliest firmware isn't supported.
 - Content with a personalized (console-bound) ticket can't be converted.
-- Output is XCI only. NSP output, NSZ compression, trimming and verification from NSC_Builder
-  aren't ported yet.
+- Output is an XCI or an extracted folder. NSP output, NSZ compression, trimming and
+  verification from NSC_Builder aren't ported yet.
+- Sparse storage (used by a few titles whose base data ships in the update) can't be extracted
+  yet.
 
 ## Credits
 
