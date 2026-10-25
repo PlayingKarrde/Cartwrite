@@ -5,7 +5,7 @@ use std::fs::File;
 use crate::crypto::{ecb_decrypt, ecb_encrypt, Ctr, Key128, Xts};
 use crate::error::{fmt_err, Error, Result};
 use crate::keys::{master_key_index, Keys};
-use crate::util::{read_at, u32le, u64le};
+use crate::util::{read_at, u16le, u32le, u64le};
 
 pub const HEADER_SIZE: usize = 0xC00;
 
@@ -39,6 +39,12 @@ pub const CRYPT_NONE: u8 = 1;
 pub const CRYPT_XTS: u8 = 2;
 pub const CRYPT_CTR: u8 = 3;
 pub const CRYPT_BKTR: u8 = 4;
+
+/// Section filesystem and hash types from the FS header.
+pub const FS_ROMFS: u8 = 0;
+pub const FS_PFS0: u8 = 1;
+pub const HASH_SHA256: u8 = 2;
+pub const HASH_IVFC: u8 = 3;
 
 #[derive(Clone)]
 pub struct NcaHeader {
@@ -122,6 +128,31 @@ impl NcaHeader {
         self.fs_header(i)[4]
     }
 
+    /// Filesystem type of section `i`: [`FS_ROMFS`] or [`FS_PFS0`].
+    pub fn section_fs_type(&self, i: usize) -> u8 {
+        self.fs_header(i)[2]
+    }
+
+    /// Hash type of section `i`: [`HASH_SHA256`] (PFS0) or [`HASH_IVFC`] (RomFS) in practice.
+    pub fn section_hash_type(&self, i: usize) -> u8 {
+        self.fs_header(i)[3]
+    }
+
+    /// Storage layers under section `i` that reading it doesn't support yet: sparse storage
+    /// (data that ships in a later update) and LZ4-compressed storage, both from newer NCAs.
+    /// Mirrors LibHac's `ExistsSparseLayer` / `ExistsCompressionLayer`.
+    pub fn unsupported_layer(&self, i: usize) -> Option<&'static str> {
+        let fs = self.fs_header(i);
+        // SparseInfo is at 0x148 (generation at +0x28), CompressionInfo at 0x178.
+        if u16le(fs, 0x170) != 0 {
+            Some("sparse storage")
+        } else if u64le(fs, 0x178) != 0 && u64le(fs, 0x180) != 0 {
+            Some("compressed storage")
+        } else {
+            None
+        }
+    }
+
     /// Upper 8 bytes of the AES-CTR counter for section `i`.
     pub fn section_nonce(&self, i: usize) -> [u8; 8] {
         let mut n: [u8; 8] = self.fs_header(i)[0x140..0x148].try_into().unwrap();
@@ -187,6 +218,14 @@ pub fn decrypt_title_key(keys: &Keys, enc: &Key128, key_generation: u8) -> Resul
 /// Something that can return plaintext bytes at an absolute offset inside an NCA.
 pub trait NcaSource {
     fn read_plain(&mut self, header: &NcaHeader, key: &Key128, offset: u64, buf: &mut [u8]) -> Result<()>;
+
+    /// The bytes as stored (still encrypted). Update sections need this, since their crypto
+    /// varies by region. The default re-applies the section crypto to `read_plain`'s output
+    /// (all of it is AES-CTR, so applying it twice is a no-op).
+    fn read_raw(&mut self, header: &NcaHeader, key: &Key128, offset: u64, buf: &mut [u8]) -> Result<()> {
+        self.read_plain(header, key, offset, buf)?;
+        decrypt_in_place(header, key, offset, buf)
+    }
 }
 
 /// An encrypted NCA stored at `base` inside a file.
@@ -204,6 +243,10 @@ impl NcaSource for FileNca<'_> {
         decrypt_in_place(header, key, aligned, &mut tmp)?;
         buf.copy_from_slice(&tmp[pad..]);
         Ok(())
+    }
+
+    fn read_raw(&mut self, _header: &NcaHeader, _key: &Key128, offset: u64, buf: &mut [u8]) -> Result<()> {
+        Ok(read_at(self.file, self.base + offset, buf)?)
     }
 }
 
