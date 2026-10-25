@@ -35,9 +35,16 @@ it.
 
 ### 1. Get the app
 
-Download the latest zip from the [Releases](../../releases) page, extract it anywhere and run
-`cartwrite.exe`. Windows builds are provided; on Linux and macOS, build it from source (see
-[Building from source](#building-from-source)).
+Download the package for your system from the [Releases](../../releases) page:
+
+- **Windows:** `Cartwrite-<version>-windows-x64.zip`. Extract it anywhere and run `cartwrite.exe`.
+- **Linux:** `Cartwrite-<version>-linux-x64.tar.gz`. Extract it and run `./cartwrite`. It needs an
+  X11 or Wayland desktop, and its file dialogs use the XDG desktop portal.
+- **macOS:** `Cartwrite-<version>-macos-universal.tar.gz`, for Apple silicon and Intel Macs.
+  Extract it and open `Cartwrite.app`. The app isn't signed by Apple, so the first time,
+  right-click it and choose **Open**.
+
+You can also build it yourself (see [Building from source](#building-from-source)).
 
 ### 2. Add your keys
 

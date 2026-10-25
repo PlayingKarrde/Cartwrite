@@ -1,0 +1,137 @@
+# Builds Cartwrite for Windows, Linux and macOS and attaches the packages to the GitHub release of a tag.
+#
+# Runs when a v* tag is pushed. If the release doesn't exist yet it is created as a draft, so the notes can be
+# written before it's published. Run it by hand (Actions > Release > Run workflow) to build an existing tag again;
+# packages the release already has are left as they are, so this also adds missing platforms to an older release.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build, for example v0.1.4"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows
+            os: windows-latest
+          - platform: linux
+            # The oldest available runner, so the binaries run on older glibc versions too.
+            os: ubuntu-22.04
+          - platform: macos
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out the tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      # Packaging comes from the workflow's own commit, so older tags can be packaged too.
+      - name: Check out the packaging script
+        uses: actions/checkout@v4
+        with:
+          path: ci
+          sparse-checkout: |
+            packaging
+            LICENSE
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: Install Linux build dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxcb-render0-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev
+
+      - name: Test
+        run: cargo test --workspace --release
+
+      - name: Build
+        if: matrix.platform != 'macos'
+        run: |
+          cargo build --release --workspace
+          exe=${{ matrix.platform == 'windows' && '.exe' || '' }}
+          mkdir bin
+          cp "target/release/cartwrite$exe" "target/release/cartwrite-cli$exe" bin/
+
+      - name: Build (universal macOS binaries)
+        if: matrix.platform == 'macos'
+        run: |
+          cargo build --release --workspace --target aarch64-apple-darwin
+          cargo build --release --workspace --target x86_64-apple-darwin
+          mkdir bin
+          for b in cartwrite cartwrite-cli; do
+            lipo -create -output "bin/$b" "target/aarch64-apple-darwin/release/$b" "target/x86_64-apple-darwin/release/$b"
+          done
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Package
+        run: python ci/packaging/package.py "${TAG#v}" ${{ matrix.platform }} bin dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Attach the packages to the release
+        run: |
+          version="${TAG#v}"
+          if ! gh release view "$TAG" > /dev/null 2>&1; then
+            gh release create "$TAG" --draft --title "Cartwrite $version" --notes "Cartwrite $version."
+          fi
+          existing=$(gh release view "$TAG" --json assets --jq '.assets[].name')
+          sums=""
+          for f in dist/*; do
+            name=$(basename "$f")
+            if grep -qxF "$name" <<< "$existing"; then
+              echo "$name is already attached, leaving it as it is"
+              continue
+            fi
+            gh release upload "$TAG" "$f"
+            sum=$(sha256sum "$f" | cut -d' ' -f1 | tr a-f A-F)
+            sums+="- \`$name\`: \`$sum\`"$'\n'
+          done
+          if [ -n "$sums" ]; then
+            gh release view "$TAG" --json body --jq .body > notes.md
+            printf '\nSHA-256 of the packages added by the release build:\n\n%s' "$sums" >> notes.md
+            gh release edit "$TAG" --notes-file notes.md
+          fi
