@@ -12,8 +12,8 @@ What's in this package
 Setup
 -----
 
-Cartwrite needs a prod.keys file dumped from your own console (for example with
-Lockpick_RCM). No keys are included. Put prod.keys in one of these places:
+Cartwrite needs a prod.keys file dumped from your own console. No keys are
+included. Put prod.keys in one of these places:
 
   - %USERPROFILE%\.switch\prod.keys (Windows) or ~/.switch/prod.keys (Linux, macOS)
   - next to the Cartwrite program
@@ -37,8 +37,8 @@ Extracting to a folder
 Click Extract... on a game card, choose Game only or Game + DLC, pick a destination
 and click Extract. The game goes to its own folder, holding exefs, romfs, control
 and logo, with the update applied to romfs. DLC goes to a second folder next to
-it, named "<game folder> DLC", as <title id>/romfs. Point tools such as
-recompilations at the game folder.
+it, named "<game folder> DLC", as <title id>/romfs. Tools that read an extracted
+game usually want the game folder, the one that holds exefs and romfs.
 
 NSZ and XCZ input is decompressed to a temporary folder first, so it needs extra
 free space while it runs.

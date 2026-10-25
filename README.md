@@ -16,13 +16,14 @@ it.
   version of each DLC. Older and duplicate copies are listed but left out.
 - Shows each game's name, icon, publisher and version before you build, so you can check what
   will go into the XCI and untick anything you don't want.
-- Converts eShop content to standard crypto (moves the title key out of the ticket), so the
-  XCI installs and runs without tickets.
+- Converts content that relies on a ticket to the standard encryption that game cards use,
+  since an XCI has no place for tickets.
 - Can lower the required system version so the game doesn't ask for a system update it doesn't
   need (see [Options](#options)).
 - Can split output into 4 GB parts for FAT32 SD cards.
 - Can also extract a game to a folder with its update applied (exefs, romfs and control), and
-  optionally each DLC's data to a folder next to it, for modding, emulators or recompilations.
+  optionally each DLC's data to a folder next to it, for example to look inside a game you own
+  or to mod it.
 - Optional check for newer updates and missing DLC against a title database you choose. Off by
   default.
 - Optional region badges (US, EU, JP, Asia, KR) showing which eShop each release comes from.
@@ -48,8 +49,8 @@ You can also build it yourself (see [Building from source](#building-from-source
 
 ### 2. Add your keys
 
-Cartwrite needs a `prod.keys` file dumped from your own console (for example with Lockpick_RCM).
-No keys are included with the app.
+Cartwrite needs a `prod.keys` file dumped from your own console. No keys are included with the
+app.
 
 Put `prod.keys` in any of these places and Cartwrite will find it:
 
@@ -112,7 +113,8 @@ goes to a second folder next to it, so the game folder only ever holds the game 
 <name> DLC/<id>/romfs/     each DLC's data, with its DLC update applied (Game + DLC only)
 ```
 
-Point tools such as recompilations at `<name>`, the folder that holds `exefs` and `romfs`.
+Tools that read an extracted game usually want `<name>`, the folder that holds `exefs` and
+`romfs`.
 
 - The update's RomFS patch is applied to the base game, so `romfs/` is the game as the console
   sees it.
@@ -293,8 +295,8 @@ cargo test --workspace
 
 Cartwrite is a rewrite inspired by [NSC_Builder](https://github.com/julesontheroad/NSC_BUILDER)
 by julesontheroad. The XCI layout, title rights conversion, required system version patching
-and file naming follow NSC_Builder, which itself builds on blawar's nut and LucaFraga's
-hacbuild. Format details were checked against [LibHac](https://github.com/thealexbarney/libhac).
+and file naming follow NSC_Builder. Format details were checked against
+[LibHac](https://github.com/thealexbarney/libhac).
 
 Cartwrite is not affiliated with or endorsed by NSC_Builder's author or by Nintendo. It contains
 no keys or copyrighted game content. You need to supply your own `prod.keys` from your own

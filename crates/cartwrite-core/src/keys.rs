@@ -1,4 +1,4 @@
-//! Loading of the user's `prod.keys` (Lockpick/hactool format).
+//! Loading of the user's `prod.keys` (`name = hex` lines, as hactool reads them).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
