@@ -210,9 +210,21 @@ pub struct AesCtrExStorage<'a> {
     secure_value: u32,
     /// Absolute NCA offset of the section, which the counter is based on.
     counter_offset: u64,
+    /// `aes_ctr_ex_offset`: everything before the AesCtrEx table.
+    data_size: u64,
+    /// Where the per-region counters stop; from here to `data_size` the section's ordinary
+    /// counter applies. See [`AesCtrExStorage::new`].
+    regions_end: u64,
+    /// The section's ordinary counter (`None` if the section is unencrypted).
+    header_nonce: Option<[u8; 8]>,
 }
 
 impl<'a> AesCtrExStorage<'a> {
+    /// Usually the AesCtrEx regions cover everything up to the AesCtrEx table, indirect table
+    /// included. Sections with a patch meta hash layer (FS header byte 5 = 1, e.g. Breath of
+    /// the Wild's updates) instead keep both tables under the ordinary counter, and their
+    /// regions stop at `indirect_offset` (Atmosphère's `CreatePatchMetaStorage`). Any bytes
+    /// the regions don't cover use the ordinary counter either way, as hactool reads them.
     pub fn new(mut raw: RawSection<'a>, header: &NcaHeader, key: Key128, section: usize) -> Result<Self> {
         let info = PatchInfo::parse(header, section);
         if !info.has_aes_ctr_ex_table() || !info.has_indirect_table() {
@@ -243,25 +255,55 @@ impl<'a> AesCtrExStorage<'a> {
         if !table.end.is_multiple_of(16) || table.entries.iter().any(|e| !e.offset.is_multiple_of(16)) {
             return fmt_err("AesCtrEx table has a region that isn't 16-byte aligned");
         }
+        if table.start() != 0 {
+            return fmt_err("AesCtrEx table doesn't start at offset 0");
+        }
         let secure_value = u32le(header.fs_header(section), 0x144);
-        Ok(Self { raw, table, key, secure_value, counter_offset })
+        let header_nonce = (header.section_crypto(section) != CRYPT_NONE).then(|| header.section_nonce(section));
+        let has_meta_hash_layer = header.fs_header(section)[5] == 1;
+        let regions_end = if has_meta_hash_layer { table.end.min(info.indirect_offset) } else { table.end };
+        Ok(Self {
+            raw,
+            table,
+            key,
+            secure_value,
+            counter_offset,
+            data_size: info.aes_ctr_ex_offset,
+            regions_end,
+            header_nonce,
+        })
     }
 }
 
 impl Storage for AesCtrExStorage<'_> {
+    /// Everything before the AesCtrEx table.
     fn size(&self) -> u64 {
-        self.table.end
+        self.data_size
     }
 
     fn read(&mut self, offset: u64, buf: &mut [u8]) -> Result<()> {
         if buf.is_empty() {
             return Ok(());
         }
-        self.table.check_range(offset, buf.len(), "AesCtrEx")?;
+        if offset.checked_add(buf.len() as u64).is_none_or(|end| end > self.data_size) {
+            return fmt_err("read outside the AesCtrEx table's range");
+        }
         self.raw.read(offset, buf)?;
         let end = offset + buf.len() as u64;
-        let mut i = self.table.find(offset);
         let mut pos = offset;
+        // Past the regions: the section's ordinary counter.
+        let regions_end = self.regions_end;
+        if end > regions_end {
+            let from = pos.max(regions_end);
+            if let Some(nonce) = self.header_nonce {
+                Ctr::new(&self.key, nonce).apply(self.counter_offset + from, &mut buf[(from - offset) as usize..]);
+            }
+            if pos >= regions_end {
+                return Ok(());
+            }
+        }
+        let end = end.min(regions_end);
+        let mut i = self.table.find(offset);
         while pos < end {
             let e = self.table.entries[i];
             let piece_end = self.table.entry_end(i).min(end);
@@ -351,15 +393,19 @@ impl Storage for IndirectStorage<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use aes::cipher::{generic_array::GenericArray, BlockEncrypt, KeyInit};
     use aes::Aes128;
+    use sha2::{Digest, Sha256};
 
     use super::*;
+    use crate::keys::Keys;
     use crate::nca::{self, NcaContentType, NcaSource, CRYPT_BKTR, HEADER_SIZE};
     use crate::storage::NcaSection;
     use crate::testutil::{
-        bucket_tree, bucket_tree_header, ctr_ex_entry, indirect_entry, pattern, ImageBuilder, NcaBuilder, PatchSection,
-        Section, TempDir, TestKeys, BUCKET_NODE_SIZE,
+        bucket_tree, bucket_tree_header, ctr_ex_entry, indirect_entry, pattern, BuiltNca, ImageBuilder, NcaBuilder,
+        PatchLayout, PatchSection, Section, TempDir, TestKeys, BUCKET_NODE_SIZE, META_HASH_SIZE,
     };
 
     // These tests describe update sections from the format (the bucket tree and AesCtrEx layouts of Atmosphère's
@@ -1259,6 +1305,367 @@ mod tests {
                 let mut data = SubStorage::new(&mut patched, offset, size).unwrap();
                 assert_same(&label, &read_vec(&mut data, 0, new_image.len()), &new_image);
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------------------
+    // AesCtrEx regions that stop before the tables: the patch meta hash layer, and the hactool fallback
+    // -----------------------------------------------------------------------------------------------------
+
+    // A section with a patch meta hash layer (FS header byte 5 = 1, like the updates of Breath of the Wild) keeps both
+    // of its tables under the section's ordinary counter (the upper IV from the FS header at 0x140, at the table's
+    // absolute offset in the NCA), and its AesCtrEx regions cover only the update's own data: the tree ends at the
+    // indirect table (Atmosphère's `CreatePatchMetaStorage`). With the flag that holds even if the regions say they
+    // run on over the tables. Without the flag, bytes that no region covers are read with the ordinary counter too,
+    // as hactool does. The fixtures write all of this from that description (`PatchSection::meta_hash_layer`,
+    // `regions_cover_tables`, `regions_stop_at_indirect`), and the tests read them back through the layers.
+
+    /// A base game, and the RomFS that an update turns its RomFS section into.
+    struct Game {
+        keys: Keys,
+        base_nca: BuiltNca,
+        base_plain: Vec<u8>,
+        new_image: Vec<u8>,
+        /// The patched section, which reading the update through the base game has to give.
+        want: Vec<u8>,
+    }
+
+    impl Game {
+        const BASE_ID: u64 = 0x0100_0000_0001_0000;
+        const UPDATE_KEY: Key128 =
+            [0x33, 0xC0, 0x9A, 0x71, 0x05, 0xE8, 0x4D, 0xB2, 0x6F, 0x19, 0xA4, 0x80, 0x3B, 0xD6, 0x5E, 0xF7];
+
+        fn new(keys_dir: &Path) -> Self {
+            let keys = TestKeys::keys(keys_dir);
+            let keep = pattern(120_000, 1);
+            let mut old = ImageBuilder::new();
+            old.file("a/keep.bin", &keep);
+            old.file("b/change.bin", &pattern(50_000, 2));
+            old.file("gone.bin", &pattern(30_000, 3));
+            old.file("c/tail.txt", b"unchanged tail");
+            old.dir("empty");
+            // A new first file moves everything after it, and one file changes.
+            let mut new = ImageBuilder::new();
+            new.file("fresh.bin", &pattern(20_000, 4));
+            new.file("a/keep.bin", &keep);
+            new.file("b/change.bin", &pattern(50_001, 5));
+            new.file("c/tail.txt", b"unchanged tail");
+            new.file("c/more/added.bin", &pattern(3_000, 6));
+            new.dir("empty");
+
+            let base_section = Section::romfs(old.build());
+            let base_plain = base_section.plaintext();
+            let base_nca = NcaBuilder::new(NcaContentType::Program, Self::BASE_ID).section(base_section).build(&keys);
+            let new_image = new.build();
+            let want = Section::romfs(new_image.clone()).plaintext();
+            Self { keys, base_nca, base_plain, new_image, want }
+        }
+
+        /// A patch from the base game's section to the new one. Chunks of 0x10 find the big file again wherever it
+        /// moved to.
+        fn patch(&self) -> PatchSection {
+            PatchSection::new(&self.base_plain, &self.new_image).chunk_size(0x10)
+        }
+
+        /// An update NCA whose only section is `patch`.
+        fn update(&self, patch: PatchSection) -> BuiltNca {
+            NcaBuilder::new(NcaContentType::Program, Self::BASE_ID | 0x800)
+                .section_key(Self::UPDATE_KEY)
+                .section(Section::patch(patch))
+                .build(&self.keys)
+        }
+
+        /// Opens section 0 of `update`, as `header` describes it (which a test may have changed), over the base game's
+        /// section. Layer 1 is handed to `on_layer1` before the indirect table is read from it, then the patched
+        /// section to `on_patched`. Fails if either layer doesn't open.
+        fn open(
+            &self,
+            update: &BuiltNca,
+            header: &NcaHeader,
+            on_layer1: impl FnOnce(&mut AesCtrExStorage<'_>),
+            on_patched: impl FnOnce(&mut IndirectStorage<'_>),
+        ) -> Result<()> {
+            let base_header = NcaHeader::decrypt(&self.base_nca.bytes, &self.keys)?;
+            let base_key = base_header.section_key(&self.keys, None)?;
+            let key = header.section_key(&self.keys, None)?;
+            let mut base_src = VecNca(self.base_nca.bytes.clone());
+            let mut up_src = VecNca(update.bytes.clone());
+            let mut original = NcaSection::new(&mut base_src, &base_header, base_key, 0)?;
+            let raw = RawSection::new(&mut up_src, header, key, 0)?;
+            let mut ex = AesCtrExStorage::new(raw, header, key, 0)?;
+            on_layer1(&mut ex);
+            let mut patched = IndirectStorage::new(&mut original, &mut ex, header, 0)?;
+            on_patched(&mut patched);
+            Ok(())
+        }
+    }
+
+    /// What layer 1 has to return for `[0, ctr_ex_offset)`: the update's data (the pieces that the indirect entries of
+    /// storage 1 read out of `want`, the patched section, and zeros in between), then the indirect table, then zero
+    /// padding up to the AesCtrEx table.
+    fn layer1_plaintext(layout: &PatchLayout, want: &[u8]) -> Vec<u8> {
+        let mut out = vec![0u8; layout.ctr_ex_offset as usize];
+        for e in layout.entries.iter().filter(|e| e.storage_index == 1) {
+            let (virtual_offset, physical_offset, len) = (e.virtual_offset as usize, e.physical_offset as usize, e.len);
+            out[physical_offset..][..len as usize].copy_from_slice(&want[virtual_offset..][..len as usize]);
+        }
+        let encoded: Vec<Vec<u8>> = layout
+            .entries
+            .iter()
+            .map(|e| indirect_entry(e.virtual_offset, e.physical_offset, e.storage_index))
+            .collect();
+        let table = bucket_tree(&encoded, want.len() as u64);
+        assert_eq!(table.len() as u64, layout.indirect_size);
+        out[layout.indirect_offset as usize..][..table.len()].copy_from_slice(&table);
+        out
+    }
+
+    /// How an update ends its AesCtrEx regions.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Ends {
+        /// With a patch meta hash layer: at the indirect table.
+        MetaHash,
+        /// With a patch meta hash layer: at the AesCtrEx table, so over the indirect table.
+        MetaHashOverTables,
+        /// Without one: at the indirect table.
+        NoFlag,
+    }
+
+    /// Builds an update from `patch`, checks that it is stored the way `ends` says, and that the layers read it back
+    /// byte for byte: layer 1 (the update's data, the indirect table and the padding that follows it) and the patched
+    /// section. Returns whether a region starts before the indirect table and runs on into it.
+    fn check_patch(game: &Game, label: &str, patch: PatchSection, ends: Ends) -> bool {
+        println!("checking {label}");
+        let layout = patch.layout();
+        let update = game.update(patch);
+        let header = NcaHeader::decrypt(&update.bytes, &game.keys).unwrap();
+        let (i, c) = (layout.indirect_offset, layout.ctr_ex_offset);
+        let over_tables = ends == Ends::MetaHashOverTables;
+
+        // The stored section, taken apart the way the format says rather than through the readers. `ordinary` reads
+        // a range of it under the ordinary counter.
+        let fs = header.fs_header(0);
+        let section = header.section(0).unwrap();
+        let section_len = section.end - section.start;
+        let counter = Ctr::new(&Game::UPDATE_KEY, header.section_nonce(0));
+        let ordinary = |offset: u64, len: u64| {
+            let mut bytes = update.bytes[(section.start + offset) as usize..][..len as usize].to_vec();
+            counter.apply(section.start + offset, &mut bytes);
+            bytes
+        };
+        assert_eq!(header.section_crypto(0), CRYPT_BKTR, "{label}");
+        assert_eq!(fs[5], u8::from(ends != Ends::NoFlag), "{label}: the meta data hash type");
+        assert_eq!((u64le(fs, 0x100), u64le(fs, 0x108)), (i, layout.indirect_size), "{label}");
+        assert_eq!((u64le(fs, 0x120), u64le(fs, 0x128)), (c, layout.ctr_ex_size), "{label}");
+        let ctr_ex_end = c + layout.ctr_ex_size;
+        assert!(i + layout.indirect_size <= c, "{label}");
+        // Both tables are under the ordinary counter: the L1 node of each says where its tree ends.
+        let indirect = ordinary(i, layout.indirect_size);
+        assert_eq!((u32le(&indirect, 0), u64le(&indirect, 8)), (0, game.want.len() as u64), "{label}: indirect table");
+        let ctr_ex = ordinary(c, layout.ctr_ex_size);
+        let tree_end = if over_tables { c } else { i };
+        assert_eq!((u32le(&ctr_ex, 0), u64le(&ctr_ex, 8)), (0, tree_end), "{label}: where the AesCtrEx tree ends");
+        assert_eq!(layout.regions_end, tree_end, "{label}");
+        assert_eq!(layout.ordinary_counter_from, i, "{label}");
+
+        if ends == Ends::NoFlag {
+            assert!(fs[0x1A0..0x1D0].iter().all(|&b| b == 0), "{label}: no meta data hash info");
+            assert_eq!(layout.meta_hash_size, 0, "{label}");
+            assert_eq!(section_len, ctr_ex_end.next_multiple_of(0x200), "{label}: the AesCtrEx table ends the section");
+        } else {
+            // A blob after the AesCtrEx table, which the section ends after; its info says where, and its hash.
+            let (offset, size) = (u64le(fs, 0x1A0), u64le(fs, 0x1A8));
+            assert_eq!((offset, size), (layout.meta_hash_offset, META_HASH_SIZE as u64), "{label}");
+            assert!(ctr_ex_end <= offset, "{label}: the blob follows the AesCtrEx table");
+            let blob_end = (offset + size).next_multiple_of(16);
+            assert!(
+                blob_end <= section_len && section_len < blob_end + 0x200,
+                "{label}: the section ends after the blob"
+            );
+            let blob = ordinary(offset, size);
+            assert!(blob.iter().any(|&b| b != 0), "{label}");
+            assert_eq!(Sha256::digest(&blob).as_slice(), &fs[0x1B0..0x1D0], "{label}: the info's hash");
+        }
+
+        // The region in force at the indirect table: with the regions over the tables, one with a generation of its
+        // own, which is what the table would be wrongly read with. Otherwise none reaches it.
+        let at_indirect = layout.regions[layout.regions.partition_point(|r| r.offset <= i) - 1];
+        if over_tables {
+            let header_generation = u32le(fs, 0x140);
+            assert!(at_indirect.encrypted && at_indirect.generation != header_generation, "{label}: {at_indirect:?}");
+        } else {
+            assert!(layout.regions.iter().all(|r| r.offset < i), "{label}: a region starts past the update's data");
+        }
+
+        // Layer 1, in whole, around every boundary and in short reads that start and end on either side of the
+        // indirect table, then the patched section.
+        let plain = layer1_plaintext(&layout, &game.want);
+        let step = (layout.regions.len() / 200).max(1);
+        let mut boundaries: Vec<u64> = layout.regions.iter().step_by(step).map(|r| r.offset).collect();
+        boundaries.extend([i, i + layout.indirect_size, c]);
+        let entry_offsets: Vec<u64> = layout.entries.iter().map(|e| e.virtual_offset).collect();
+        game.open(
+            &update,
+            &header,
+            |ex| {
+                assert_eq!(ex.size(), c, "{label}");
+                check_reads(ex, &plain, &boundaries, 31);
+                for lo in i - 40..i + 40 {
+                    for len in [1usize, 7, 16, 33, 100] {
+                        assert_same(&format!("{len} at {lo:#x}"), &read_vec(ex, lo, len), &plain[lo as usize..][..len]);
+                    }
+                }
+            },
+            |patched| check_reads(patched, &game.want, &entry_offsets, 32),
+        )
+        .unwrap_or_else(|e| panic!("{label}: {e}"));
+        over_tables && at_indirect.offset < i
+    }
+
+    #[test]
+    fn a_meta_hash_layer_keeps_both_tables_under_the_ordinary_counter() {
+        let tmp = TempDir::new("bktr-meta-hash");
+        let game = Game::new(tmp.path());
+        let layered = || game.patch().meta_hash_layer(true);
+        let mixed: &[(u32, bool)] = &[(3, true), (1, true), (2, false), (0xFFFF_FFFF, true)];
+        let variants: Vec<(&str, PatchSection)> = vec![
+            ("defaults", layered()),
+            ("a region per block, so several sets of AesCtrEx entries", layered().ctr_ex_regions(0x10, mixed)),
+            ("generation 0, secure value 0, no gap", layered().generation(0).secure_value(0).table_gap(0)),
+            (
+                "largest generation and secure value, a large gap",
+                layered().generation(u32::MAX).secure_value(u32::MAX).table_gap(0x1_0000),
+            ),
+            ("one region", layered().ctr_ex_regions(1 << 30, &[(5, true)])),
+            ("nothing encrypted by regions", layered().ctr_ex_regions(0x3010, &[(1, false)])),
+        ];
+        for (label, patch) in variants {
+            let layout = patch.layout();
+            assert!(layout.indirect_offset > 0x10000 && layout.indirect_size > BUCKET_NODE_SIZE as u64, "{label}");
+            assert!(!check_patch(&game, label, patch, Ends::MetaHash), "{label}: regions run on into the tables");
+        }
+    }
+
+    #[test]
+    fn a_meta_hash_layer_wins_over_regions_that_run_over_the_tables() {
+        let tmp = TempDir::new("bktr-meta-hash-over");
+        let game = Game::new(tmp.path());
+        let over = || game.patch().meta_hash_layer(true).regions_cover_tables(true);
+        // Every region is encrypted, with a generation other than the header's (4, unless a variant says otherwise).
+        let own: &[(u32, bool)] = &[(1, true), (2, true), (6, true)];
+        let indirect_offset = game.patch().layout().indirect_offset as usize;
+        // Each variant, and whether a region starts before the indirect table and runs on into it (regions of 0x10
+        // can't, and neither can one that starts where the table does).
+        let variants: Vec<(&str, PatchSection, bool)> = vec![
+            ("defaults, but encrypted", over().ctr_ex_regions(0x2A10, own), true),
+            (
+                "a region per block, so several sets of AesCtrEx entries",
+                over().ctr_ex_regions(0x10, &[(3, true), (1, true)]),
+                false,
+            ),
+            (
+                "generation 0, secure value 0, no gap",
+                over().generation(0).secure_value(0).table_gap(0).ctr_ex_regions(0x2A10, own),
+                true,
+            ),
+            (
+                "largest secure value, a large gap",
+                over().generation(u32::MAX).secure_value(u32::MAX).table_gap(0x1_0000).ctr_ex_regions(0x2A10, own),
+                true,
+            ),
+            ("one region over everything", over().ctr_ex_regions(1 << 30, &[(5, true)]), true),
+            (
+                "a region starts at the indirect table",
+                over().ctr_ex_regions(indirect_offset, &[(1, true), (2, true)]),
+                false,
+            ),
+        ];
+        for (label, patch, straddles) in variants {
+            let layout = patch.layout();
+            assert_eq!(layout.regions_end, layout.ctr_ex_offset, "{label}");
+            let got = check_patch(&game, label, patch, Ends::MetaHashOverTables);
+            assert_eq!(got, straddles, "{label}: whether a region straddles the start of the indirect table");
+        }
+    }
+
+    #[test]
+    fn regions_that_stop_at_the_indirect_table_leave_the_rest_under_the_ordinary_counter() {
+        let tmp = TempDir::new("bktr-stop-early");
+        let game = Game::new(tmp.path());
+        let early = || game.patch().regions_stop_at_indirect(true);
+        let mixed: &[(u32, bool)] = &[(3, true), (1, true), (2, false), (0xFFFF_FFFF, true)];
+        let variants: Vec<(&str, PatchSection)> = vec![
+            ("defaults", early()),
+            ("a region per block, so several sets of AesCtrEx entries", early().ctr_ex_regions(0x10, mixed)),
+            ("generation 0, secure value 0, no gap", early().generation(0).secure_value(0).table_gap(0)),
+            (
+                "largest generation and secure value, a large gap",
+                early().generation(u32::MAX).secure_value(u32::MAX).table_gap(0x1_0000),
+            ),
+            ("one region", early().ctr_ex_regions(1 << 30, &[(5, true)])),
+            ("nothing encrypted by regions", early().ctr_ex_regions(0x3010, &[(1, false)])),
+        ];
+        for (label, patch) in variants {
+            assert!(!check_patch(&game, label, patch, Ends::NoFlag), "{label}: regions run on into the tables");
+        }
+    }
+
+    #[test]
+    fn the_meta_hash_flag_decides_which_counter_the_indirect_table_is_read_with() {
+        let tmp = TempDir::new("bktr-flag");
+        let game = Game::new(tmp.path());
+        // Every region is encrypted, with a generation other than the header's (4): an indirect table read with the
+        // counter of the region that covers it can't come out right by chance.
+        let own: &[(u32, bool)] = &[(1, true), (2, true), (6, true)];
+        let garbage = "indirect table has a bad";
+        let never = |_: &mut IndirectStorage<'_>| panic!("the indirect table was accepted");
+
+        // The tables are stored under the ordinary counter, the regions run on over them, and the flag is set: this
+        // reads back.
+        let patch = game.patch().meta_hash_layer(true).regions_cover_tables(true).ctr_ex_regions(0x2A10, own);
+        let layout = patch.layout();
+        let flagged = game.update(patch);
+        let mut header = NcaHeader::decrypt(&flagged.bytes, &game.keys).unwrap();
+        assert_eq!(header.fs_header(0)[5], 1);
+        game.open(&flagged, &header, |_| {}, |patched| check_reads(patched, &game.want, &[], 1)).unwrap();
+
+        // The very same bytes with the flag cleared: layer 1 now decrypts the indirect table with the counter of the
+        // region covering it, which gives garbage, and the table is refused.
+        header.fs_header_mut(0)[5] = 0;
+        let (i, len) = (layout.indirect_offset, layout.indirect_size as usize);
+        let plain = layer1_plaintext(&layout, &game.want);
+        let table_is_garbage = |ex: &mut AesCtrExStorage<'_>| {
+            assert_ne!(read_vec(ex, i, len), plain[i as usize..][..len], "the table read with the regions' counters");
+        };
+        assert_fails(game.open(&flagged, &header, table_is_garbage, never), garbage);
+
+        // And the other way round: an update that has the regions cover the indirect table and encrypts it with their
+        // counters, with no flag, reads back; the same bytes with the flag set don't.
+        let patch = game.patch().ctr_ex_regions(0x2A10, own);
+        let layout = patch.layout();
+        assert_eq!((layout.regions_end, layout.ordinary_counter_from), (layout.ctr_ex_offset, layout.ctr_ex_offset));
+        let unflagged = game.update(patch);
+        let mut header = NcaHeader::decrypt(&unflagged.bytes, &game.keys).unwrap();
+        assert_eq!(header.fs_header(0)[5], 0);
+        game.open(&unflagged, &header, |_| {}, |patched| check_reads(patched, &game.want, &[], 2)).unwrap();
+        header.fs_header_mut(0)[5] = 1;
+        let (i, len) = (layout.indirect_offset, layout.indirect_size as usize);
+        let plain = layer1_plaintext(&layout, &game.want);
+        let table_is_garbage = |ex: &mut AesCtrExStorage<'_>| {
+            assert_ne!(read_vec(ex, i, len), plain[i as usize..][..len], "the table read with the ordinary counter");
+        };
+        assert_fails(game.open(&unflagged, &header, table_is_garbage, never), garbage);
+
+        // Where the regions stop at the indirect table anyway, the flag makes no difference.
+        let layered = game.update(game.patch().meta_hash_layer(true));
+        let stopped = game.update(game.patch().regions_stop_at_indirect(true));
+        for (what, update, flag) in
+            [("a meta hash layer, flag cleared", &layered, 0), ("no layer, flag set", &stopped, 1)]
+        {
+            let mut header = NcaHeader::decrypt(&update.bytes, &game.keys).unwrap();
+            header.fs_header_mut(0)[5] = flag;
+            game.open(update, &header, |_| {}, |patched| check_reads(patched, &game.want, &[], 3))
+                .unwrap_or_else(|e| panic!("{what}: {e}"));
         }
     }
 }

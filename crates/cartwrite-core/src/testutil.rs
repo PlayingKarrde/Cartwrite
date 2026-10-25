@@ -702,13 +702,26 @@ pub struct PatchLayout {
     /// Section-relative offset of the indirect table, which is also where the update data ends.
     pub indirect_offset: u64,
     pub indirect_size: u64,
-    /// Section-relative offset of the AesCtrEx table, which is also where the AesCtrEx regions end.
+    /// Section-relative offset of the AesCtrEx table, which comes after the indirect table and its padding.
     pub ctr_ex_offset: u64,
     pub ctr_ex_size: u64,
+    /// Where the AesCtrEx regions end (the end offset of the AesCtrEx tree): `ctr_ex_offset`, or `indirect_offset` if
+    /// they cover only the update data.
+    pub regions_end: u64,
+    /// Section-relative offset from which, up to the end of the section, the stored bytes are encrypted with the
+    /// section's ordinary counter instead of the regions' counters: `ctr_ex_offset` (only the AesCtrEx table), or
+    /// `indirect_offset` (the indirect table too).
+    pub ordinary_counter_from: u64,
+    /// Section-relative offset and size of the patch meta data hash blob after the AesCtrEx table (both 0 if the
+    /// section has no patch meta hash layer).
+    pub meta_hash_offset: u64,
+    pub meta_hash_size: u64,
     /// Plaintext of `[0, ctr_ex_offset)`: the update data, the indirect table, then zero padding.
     head: Vec<u8>,
     /// The AesCtrEx table's plaintext.
     ctr_ex_table: Vec<u8>,
+    /// The meta data hash blob (empty without a patch meta hash layer).
+    meta_hash_blob: Vec<u8>,
 }
 
 /// The RomFS section of an update, built from the format description: the patched section is cut into fixed-size
@@ -720,11 +733,23 @@ pub struct PatchLayout {
 /// [0, indirect_offset)                          update data (pieces for indirect entries of storage 1)
 /// [indirect_offset, + indirect_size)            indirect bucket tree
 /// ... zero padding ...
-/// [ctr_ex_offset, + ctr_ex_size)                AesCtrEx bucket tree (its regions cover [0, ctr_ex_offset))
+/// [ctr_ex_offset, + ctr_ex_size)                AesCtrEx bucket tree (by default its regions cover [0, ctr_ex_offset))
+/// [meta_hash_offset, + meta_hash_size)          only with meta_hash_layer: the patch meta data hash blob
 /// ```
 ///
 /// Put into an NCA with [`Section::patch`]. The knobs have defaults that produce several differing AesCtrEx
-/// generations and a not-encrypted region.
+/// generations and a not-encrypted region. Three of them change where the AesCtrEx tree ends (and so which bytes the
+/// regions' counters apply to) and which counter the indirect table is encrypted with; the AesCtrEx table is always
+/// under the section's ordinary counter:
+///
+/// * By default the tree ends at `ctr_ex_offset` and the regions' counters cover the indirect table too.
+/// * [`regions_stop_at_indirect`](Self::regions_stop_at_indirect): the tree ends at `indirect_offset`, and
+///   everything from there on is under the ordinary counter.
+/// * [`meta_hash_layer`](Self::meta_hash_layer): the same, and the section gets a meta data hash blob and the FS
+///   header fields that describe it.
+/// * [`meta_hash_layer`](Self::meta_hash_layer) with [`regions_cover_tables`](Self::regions_cover_tables): the
+///   tree ends at `ctr_ex_offset` again, but the bytes from `indirect_offset` on are still under the ordinary
+///   counter, whatever the regions say.
 #[derive(Clone)]
 pub struct PatchSection {
     /// The base game's section, as its NCA holds it (decrypted).
@@ -744,7 +769,16 @@ pub struct PatchSection {
     region_size: usize,
     region_pattern: Vec<(u32, bool)>,
     gap: usize,
+    meta_hash: bool,
+    cover_tables: bool,
+    stop_at_indirect: bool,
 }
+
+/// Size of the meta data hash blob that [`PatchSection::meta_hash_layer`] adds.
+pub const META_HASH_SIZE: usize = 0xE8;
+
+/// Where the FS header keeps its `NcaMetaDataHashDataInfo`: offset, size, hash (u64, u64, 32 bytes).
+const META_HASH_INFO: usize = 0x1A0;
 
 impl PatchSection {
     /// A patch that turns `base_section` (the base game's decrypted RomFS section, see [`Section::plaintext`]) into
@@ -766,6 +800,9 @@ impl PatchSection {
             region_size: 0x2A10,
             region_pattern: vec![(1, true), (2, true), (3, false), (6, true)],
             gap: 0x200,
+            meta_hash: false,
+            cover_tables: false,
+            stop_at_indirect: false,
         }
     }
 
@@ -824,9 +861,49 @@ impl PatchSection {
         self
     }
 
+    /// Makes this a section with a patch meta hash layer, like the Breath of the Wild updates (Atmosphère's
+    /// `NcaFileSystemDriver::CreatePatchMetaStorage`). FS header byte 5 (`meta_data_hash_type`) is 1, and the
+    /// `NcaMetaDataHashDataInfo` at 0x1A0 (offset, size, SHA-256) points at a [`META_HASH_SIZE`]-byte blob placed
+    /// after the AesCtrEx table, which the section is padded to hold. Both tables are encrypted with the section's
+    /// ordinary counter (the upper IV from the FS header at 0x140, at the absolute offset), not with AesCtrEx region
+    /// counters, and the AesCtrEx regions cover only the update data: the tree ends at `indirect_offset`, unless
+    /// [`regions_cover_tables`](Self::regions_cover_tables) says otherwise.
+    pub fn meta_hash_layer(mut self, on: bool) -> Self {
+        self.meta_hash = on;
+        self
+    }
+
+    /// With [`meta_hash_layer`](Self::meta_hash_layer): the AesCtrEx regions extend over the tables anyway (the tree
+    /// ends at `ctr_ex_offset`, as without the layer), so the region that is in force at the indirect table has a
+    /// generation of its own, but the stored bytes from `indirect_offset` on are still under the ordinary counter:
+    /// with the layer, the flag wins over what the regions say.
+    pub fn regions_cover_tables(mut self, on: bool) -> Self {
+        self.cover_tables = on;
+        self
+    }
+
+    /// Without a meta hash layer: the AesCtrEx regions stop at `indirect_offset` (the tree ends there), and
+    /// everything from the indirect table on, up to the end of the section, is under the ordinary counter, which is
+    /// how hactool reads bytes that no region covers.
+    pub fn regions_stop_at_indirect(mut self, on: bool) -> Self {
+        self.stop_at_indirect = on;
+        self
+    }
+
+    /// Whether the AesCtrEx regions stop at `indirect_offset` instead of running to `ctr_ex_offset`.
+    fn regions_end_at_indirect(&self) -> bool {
+        if self.meta_hash {
+            !self.cover_tables
+        } else {
+            self.stop_at_indirect
+        }
+    }
+
     /// Diffs, builds both tables and works out where everything goes.
     pub fn layout(&self) -> PatchLayout {
         assert!(!self.target.is_empty());
+        assert!(!self.cover_tables || self.meta_hash, "regions_cover_tables goes with meta_hash_layer");
+        assert!(!(self.cover_tables && self.stop_at_indirect), "regions can't both cover the tables and stop early");
         let chunk = self.chunk;
 
         // Where each aligned chunk of the base game first appears.
@@ -863,7 +940,7 @@ impl PatchSection {
             }
         }
 
-        // Update data, indirect table, padding; the AesCtrEx regions cover all of it.
+        // Update data, indirect table, padding; the AesCtrEx regions cover all of it, or just the update data.
         let indirect_offset = update_data.len().next_multiple_of(SECTION_ALIGN);
         update_data.resize(indirect_offset, 0);
         let indirect_entries: Vec<Vec<u8>> =
@@ -874,7 +951,9 @@ impl PatchSection {
         head.extend_from_slice(&indirect_table);
         head.resize(ctr_ex_offset, 0);
 
-        let regions: Vec<CtrExRegion> = (0..ctr_ex_offset)
+        let regions_end = if self.regions_end_at_indirect() { indirect_offset } else { ctr_ex_offset };
+        assert!(regions_end > 0, "the AesCtrEx regions need some update data to cover");
+        let regions: Vec<CtrExRegion> = (0..regions_end)
             .step_by(self.region_size)
             .enumerate()
             .map(|(i, offset)| {
@@ -884,9 +963,19 @@ impl PatchSection {
             .collect();
         let ctr_ex_entries: Vec<Vec<u8>> =
             regions.iter().map(|r| ctr_ex_entry(r.offset, r.encrypted, r.generation)).collect();
-        let mut ctr_ex_table = bucket_tree(&ctr_ex_entries, ctr_ex_offset as u64);
+        let mut ctr_ex_table = bucket_tree(&ctr_ex_entries, regions_end as u64);
         let ctr_ex_size = ctr_ex_table.len() as u64;
         pad_to(&mut ctr_ex_table, SECTION_ALIGN);
+
+        // The meta data hash blob follows the AesCtrEx table. Its content is arbitrary (nothing in the crate reads
+        // it); the info in the FS header carries its SHA-256.
+        let (meta_hash_offset, meta_hash_blob) = if self.meta_hash {
+            ((ctr_ex_offset + ctr_ex_table.len()) as u64, pattern(META_HASH_SIZE, 0x4D45_5441))
+        } else {
+            (0, Vec::new())
+        };
+        let ordinary_counter_from =
+            if self.meta_hash || self.stop_at_indirect { indirect_offset } else { ctr_ex_offset };
 
         PatchLayout {
             entries,
@@ -895,13 +984,19 @@ impl PatchSection {
             indirect_size: indirect_table.len() as u64,
             ctr_ex_offset: ctr_ex_offset as u64,
             ctr_ex_size,
+            regions_end: regions_end as u64,
+            ordinary_counter_from: ordinary_counter_from as u64,
+            meta_hash_offset,
+            meta_hash_size: meta_hash_blob.len() as u64,
             head,
             ctr_ex_table,
+            meta_hash_blob,
         }
     }
 
     /// Fills in the FS header `fs`: encryption type 4, the IVFC levels of the patched section, the patch info
-    /// (0x100..0x140), the generation and secure value (0x140, 0x144) and the compression info, if any.
+    /// (0x100..0x140), the generation and secure value (0x140, 0x144), the compression info, if any, and the meta
+    /// data hash type (byte 5) and info (0x1A0), if the section has a patch meta hash layer.
     fn write_fs_header(&self, layout: &PatchLayout, fs: &mut [u8]) {
         fs[..0x100].copy_from_slice(&self.fs_prefix);
         fs[4] = CRYPT_BKTR;
@@ -916,25 +1011,37 @@ impl PatchSection {
         if let Some(info) = &self.compression_info {
             fs[COMPRESSION_INFO..COMPRESSION_INFO + COMPRESSION_INFO_SIZE].copy_from_slice(info);
         }
+        if self.meta_hash {
+            fs[5] = 1; // meta_data_hash_type: hierarchical integrity
+            put_u64(fs, META_HASH_INFO, layout.meta_hash_offset);
+            put_u64(fs, META_HASH_INFO + 8, layout.meta_hash_size);
+            let hash: [u8; 32] = Sha256::digest(&layout.meta_hash_blob).into();
+            fs[META_HASH_INFO + 0x10..META_HASH_INFO + 0x30].copy_from_slice(&hash);
+        }
     }
 
-    /// The section as stored in an NCA, where it starts at absolute offset `start`: every encrypted AesCtrEx
-    /// region under AES-CTR with `key` and the upper counter `secure_value << 32 | region generation` (big-endian),
-    /// the AesCtrEx table under the header's `secure_value << 32 | generation`; the low half of each counter is the
-    /// absolute offset / 16.
+    /// The section as stored in an NCA, where it starts at absolute offset `start`. Every encrypted AesCtrEx
+    /// region is under AES-CTR with `key` and the upper counter `secure_value << 32 | region generation`
+    /// (big-endian), up to where the ordinary counter takes over (`layout.ordinary_counter_from`). From there to the
+    /// end of the section (the rest of the update data and the tables, the AesCtrEx table among them, and the meta
+    /// data hash blob) the upper counter is the header's `secure_value << 32 | generation`, whatever regions say.
+    /// The low half of each counter is the absolute offset / 16.
     fn encrypt(&self, layout: &PatchLayout, start: u64, key: &Key128) -> Vec<u8> {
         let upper = |generation: u32| ((u64::from(self.secure_value) << 32) | u64::from(generation)).to_be_bytes();
+        let ordinary_from = layout.ordinary_counter_from;
         let mut stored = layout.head.clone();
         for (i, r) in layout.regions.iter().enumerate() {
-            let end = layout.regions.get(i + 1).map_or(layout.ctr_ex_offset, |next| next.offset);
-            if r.encrypted {
+            let region_end = layout.regions.get(i + 1).map_or(layout.regions_end, |next| next.offset);
+            let end = region_end.min(ordinary_from);
+            if r.encrypted && r.offset < end {
                 Ctr::new(key, upper(r.generation))
                     .apply(start + r.offset, &mut stored[r.offset as usize..end as usize]);
             }
         }
-        let mut table = layout.ctr_ex_table.clone();
-        Ctr::new(key, upper(self.generation)).apply(start + layout.ctr_ex_offset, &mut table);
-        stored.extend_from_slice(&table);
+        stored.extend_from_slice(&layout.ctr_ex_table);
+        stored.extend_from_slice(&layout.meta_hash_blob);
+        pad_to(&mut stored, SECTION_ALIGN);
+        Ctr::new(key, upper(self.generation)).apply(start + ordinary_from, &mut stored[ordinary_from as usize..]);
         stored
     }
 }

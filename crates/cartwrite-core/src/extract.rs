@@ -126,7 +126,7 @@ pub fn extract_game(
         let mut listings = Vec::with_capacity(parts.len());
         for p in &parts {
             check_cancel(cancel)?;
-            listings.push(with_part_data(keys, &p.source, |s| list(s, p.fs_type))?);
+            listings.push(with_part_data(keys, &p.source, |s| list(s, p.fs_type)).map_err(|e| in_part(e, p))?);
         }
         let total: u64 = listings.iter().map(Listing::bytes).sum();
         let mut done = 0u64;
@@ -169,7 +169,8 @@ pub fn extract_game(
                     }
                 }
                 Ok(())
-            })?;
+            })
+            .map_err(|e| in_part(e, p))?;
         }
         Ok(())
     })();
@@ -255,6 +256,16 @@ fn plan_parts<'a>(keys: &Keys, titles: &[&'a Title], opts: &ExtractOptions) -> R
         }
     }
     Ok(parts)
+}
+
+/// Says which part a format error came from (e.g. "romfs (… + update …): …").
+fn in_part(e: Error, p: &Part) -> Error {
+    let at = || format!("{} ({})", p.dest.display(), p.source.label());
+    match e {
+        Error::Format(m) => Error::Format(format!("{}: {m}", at())),
+        Error::Unsupported(m) => Error::Unsupported(format!("{}: {m}", at())),
+        other => other,
+    }
 }
 
 fn single_program(title: &Title) -> Result<&NcaRef> {
@@ -666,6 +677,18 @@ mod tests {
     /// is the base's patched, and the base's boot logo stays.
     #[test]
     fn extract_base_plus_update_end_to_end() {
+        base_plus_update_end_to_end(false);
+    }
+
+    /// The same, with an update whose RomFS section has a patch meta hash layer, as Breath of the Wild's updates
+    /// do: both tables are under the section's ordinary counter, and the AesCtrEx regions cover only the update's
+    /// data.
+    #[test]
+    fn extract_update_with_patch_meta_hash_layer_end_to_end() {
+        base_plus_update_end_to_end(true);
+    }
+
+    fn base_plus_update_end_to_end(meta_hash_layer: bool) {
         const APP_ID: u64 = 0x0100_0000_0001_0000;
         const UPDATE_ID: u64 = APP_ID | 0x800;
         const UPDATE_VERSION: u32 = 65536;
@@ -677,7 +700,7 @@ mod tests {
         const UPDATE_CONTROL_KEY: Key128 =
             [0xA3, 0x5C, 0x18, 0xEF, 0x62, 0xB9, 0x0A, 0x74, 0xD1, 0x3E, 0x87, 0x2B, 0xC6, 0x59, 0xF0, 0x93];
 
-        let tmp = TempDir::new("extract-update");
+        let tmp = TempDir::new(if meta_hash_layer { "extract-update-meta-hash" } else { "extract-update" });
         let keys = TestKeys::keys(&tmp.path().join("keys"));
 
         // The base game. The big file is in both versions of the RomFS and moves when the files before it change
@@ -738,7 +761,7 @@ mod tests {
         // The patch is made against the base game's section as its NCA stores it. Chunks of 0x10 find the big file
         // again whatever the shift, which the new files in front of it and the bigger tables cause.
         let patch = PatchSection::new(&base_section.plaintext(), &romfs_image(&new_romfs, &new_empty_dirs));
-        let patch = patch.chunk_size(0x10);
+        let patch = patch.chunk_size(0x10).meta_hash_layer(meta_hash_layer);
         let layout = patch.layout();
         // Not a trivial patch: both storages are used, the base game's data is read from other places than it
         // stands in the new section, and the 9 MiB file is not carried by the update.
@@ -752,23 +775,36 @@ mod tests {
             .count();
         assert_eq!(moved_big, 1, "{:x?}", layout.entries);
         assert!(layout.indirect_offset < 1 << 20, "the update carries {:#x} bytes", layout.indirect_offset);
-        // Its AesCtrEx regions have several generations and one of them is not encrypted; one runs from the update
-        // data into the indirect table.
+        // Its AesCtrEx regions have several generations and one of them is not encrypted. Normally one runs from the
+        // update data into the indirect table. With a meta hash layer the regions end at the indirect table, and the
+        // layer's blob follows the AesCtrEx table.
         let generations: BTreeSet<u32> = layout.regions.iter().map(|r| r.generation).collect();
         assert!(generations.len() >= 3 && layout.regions.iter().any(|r| !r.encrypted), "{:?}", layout.regions);
-        let ends = layout.regions.iter().skip(1).map(|r| r.offset).chain([layout.ctr_ex_offset]);
+        let ends = layout.regions.iter().skip(1).map(|r| r.offset).chain([layout.regions_end]);
         let straddles = layout
             .regions
             .iter()
             .zip(ends)
             .any(|(r, end)| r.offset < layout.indirect_offset && end > layout.indirect_offset);
-        assert!(straddles, "no region covers both the update data and the indirect table");
+        if meta_hash_layer {
+            assert_eq!(layout.regions_end, layout.indirect_offset);
+            assert!(!straddles && layout.meta_hash_offset >= layout.ctr_ex_offset + layout.ctr_ex_size);
+            assert!(layout.meta_hash_size > 0);
+        } else {
+            assert!(straddles, "no region covers both the update data and the indirect table");
+            assert_eq!((layout.regions_end, layout.meta_hash_size), (layout.ctr_ex_offset, 0));
+        }
 
         let up_program = NcaBuilder::new(NcaContentType::Program, UPDATE_ID)
             .section_key(UPDATE_KEY)
             .section(Section::pfs0(&as_refs(&up_exefs)))
             .section(Section::patch(patch))
             .build(&keys);
+        // The FS header of the patch section (section 1) says whether it has the layer.
+        let up_header = NcaHeader::decrypt(&up_program.bytes, &keys).unwrap();
+        let fs = up_header.fs_header(1);
+        assert_eq!(fs[5], u8::from(meta_hash_layer));
+        assert_eq!(u64le(fs, 0x1A0) != 0 && u64le(fs, 0x1A8) != 0, meta_hash_layer);
         let up_control_nca = NcaBuilder::new(NcaContentType::Control, UPDATE_ID)
             .section_key(UPDATE_CONTROL_KEY)
             .section(Section::romfs(romfs_image(&up_control, &[])))
