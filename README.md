@@ -7,7 +7,7 @@ The usual use is keeping a library of XCIs up to date. When a new update or DLC 
 it into Cartwrite along with the XCI you already have, and it builds a new XCI with everything in
 it.
 
-![Game list](docs/screenshots/games.png)
+![Start screen](docs/screenshots/start.png)
 
 ## Features
 
@@ -61,8 +61,6 @@ Put `prod.keys` in any of these places and Cartwrite will find it:
 You can also pick the file in Settings. The badge in the top right turns green once the keys
 are loaded and shows the newest master key they contain.
 
-![Start screen](docs/screenshots/start.png)
-
 ## Using Cartwrite
 
 ### Build an XCI from a game and its update
@@ -92,8 +90,6 @@ kept.
 
 Open **Contents** on a game card to see every title that was found, with its version, size,
 required firmware and source file. Untick a row to leave it out of the build.
-
-![Contents list](docs/screenshots/contents.png)
 
 ### Extract a game to a folder
 
@@ -138,8 +134,6 @@ each game card shows how your files compare with a community title database:
 - **N DLC outdated**: you have the DLC, but an older version of it.
 - **Not in title database**: the database doesn't list this game.
 
-![Update check result](docs/screenshots/update-check.png)
-
 How it works:
 
 - The database is a single text file listing the newest version of every title. By default it
@@ -175,8 +169,6 @@ one title ID and show several flags.
   **Refresh now**, and the download runs in the background.
 - The source can be any URL or a local folder that holds those five files.
 
-![Region badges](docs/screenshots/regions.png)
-
 ### DLC from a different release
 
 Each DLC records which game it belongs to, and a game only loads DLC made for its own title
@@ -189,14 +181,14 @@ lists the DLC as a separate entry and explains why:
 
 That DLC entry starts unticked, since building it on its own is rarely useful. To get DLC that
 works, use the DLC from the same release as your base game. With region badges turned on it's
-easy to see which release is which, as in the screenshot above.
+easy to see which release is which.
 
 ### Output file names
 
 Files are named like this:
 
 ```
-Super Mario Bros. Wonder [010015100B514000][v1.2.1] (1G+1U+3D).xci
+Example Game [0100000000010000][v1.2.1] (1G+1U+3D).xci
 ```
 
 - the game's name
