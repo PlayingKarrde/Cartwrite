@@ -207,12 +207,14 @@ pub(crate) mod tests {
             is_ncz: false,
             out_name: format!("{title_id:x}{version}.cnmt.nca"),
             content_type: crate::cnmt::CT_META,
+            id_offset: 0,
             key_generation: 0,
             rights_id: None,
         };
         Title {
             title_id,
             application_id: title_id & !0x1FFF,
+            data_id: None,
             version,
             kind,
             required_system_version: None,

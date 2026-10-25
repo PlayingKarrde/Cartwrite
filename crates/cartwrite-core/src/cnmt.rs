@@ -40,6 +40,8 @@ pub struct Cnmt {
     pub meta_type: u8,
     /// The base application this content belongs to.
     pub application_id: u64,
+    /// For a DLC update (data patch): the DLC title it updates (DataPatchMetaExtendedHeader DataId, at ext+0).
+    pub data_id: Option<u64>,
     /// Present for applications and patches (absolute offset 0x28 in the cnmt).
     pub required_system_version: Option<u32>,
     pub contents: Vec<ContentRecord>,
@@ -79,6 +81,7 @@ impl Cnmt {
             META_DATA_PATCH => (u64le(d, ext + 8), None),
             _ => (title_id & !0x1FFF, None),
         };
+        let data_id = (meta_type == META_DATA_PATCH).then(|| u64le(d, ext));
         let contents = (0..count)
             .map(|i| {
                 let r = ext + ext_size + i * 0x38;
@@ -93,6 +96,79 @@ impl Cnmt {
                 }
             })
             .collect();
-        Ok(Self { title_id, version, meta_type, application_id, required_system_version, contents })
+        Ok(Self { title_id, version, meta_type, application_id, data_id, required_system_version, contents })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn put_u16(d: &mut [u8], at: usize, v: u16) {
+        d[at..at + 2].copy_from_slice(&v.to_le_bytes());
+    }
+
+    fn put_u32(d: &mut [u8], at: usize, v: u32) {
+        d[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    fn put_u64(d: &mut [u8], at: usize, v: u64) {
+        d[at..at + 8].copy_from_slice(&v.to_le_bytes());
+    }
+
+    /// A cnmt of `meta_type` with `ext` as extended header and one content record (a program with `id_offset`).
+    fn cnmt_bytes(title_id: u64, version: u32, meta_type: u8, ext: &[u8], id_offset: u8) -> Vec<u8> {
+        let mut d = vec![0u8; 0x20];
+        put_u64(&mut d, 0, title_id);
+        put_u32(&mut d, 8, version);
+        d[0xC] = meta_type;
+        put_u16(&mut d, 0xE, ext.len() as u16);
+        put_u16(&mut d, 0x10, 1);
+        d.extend_from_slice(ext);
+        let mut record = [0u8; 0x38];
+        record[0x20..0x30].copy_from_slice(&[0xAB; 16]);
+        record[0x30] = 0x10;
+        record[0x36] = CT_PROGRAM;
+        record[0x37] = id_offset;
+        d.extend_from_slice(&record);
+        d.extend_from_slice(&[0u8; 0x20]);
+        d
+    }
+
+    #[test]
+    fn data_patch_names_the_dlc_it_updates() {
+        // DataId, ApplicationId, RequiredApplicationVersion, ExtendedDataSize, reserved.
+        const DATA_ID: u64 = 0x0100_0000_0001_1001;
+        const APPLICATION_ID: u64 = 0x0100_0000_0001_0000;
+        let mut ext = vec![0u8; 0x20];
+        put_u64(&mut ext, 0, DATA_ID);
+        put_u64(&mut ext, 8, APPLICATION_ID);
+        put_u32(&mut ext, 0x10, 0x0001_0000);
+        let c = Cnmt::parse(&cnmt_bytes(0x0100_0000_0001_1801, 0x2_0000, META_DATA_PATCH, &ext, 0)).unwrap();
+        assert_eq!((c.title_id, c.version, c.meta_type), (0x0100_0000_0001_1801, 0x2_0000, META_DATA_PATCH));
+        assert_eq!(c.data_id, Some(DATA_ID));
+        assert_eq!(c.application_id, APPLICATION_ID);
+        assert_eq!(c.required_system_version, None);
+        assert_eq!(c.contents.len(), 1);
+        assert_eq!((c.contents[0].content_type, c.contents[0].id_offset), (CT_PROGRAM, 0));
+    }
+
+    #[test]
+    fn data_patch_needs_its_ids() {
+        let err = Cnmt::parse(&cnmt_bytes(0x0100_0000_0001_1801, 0, META_DATA_PATCH, &[0u8; 8], 0)).unwrap_err();
+        assert!(err.to_string().contains("extended header too small"), "{err}");
+    }
+
+    #[test]
+    fn application_has_no_data_id() {
+        const TITLE_ID: u64 = 0x0100_0000_0001_0000;
+        let mut ext = vec![0u8; 0x10];
+        put_u64(&mut ext, 0, TITLE_ID + 0x800);
+        put_u32(&mut ext, 8, 0x0003_0000);
+        let c = Cnmt::parse(&cnmt_bytes(TITLE_ID, 0, META_APPLICATION, &ext, 1)).unwrap();
+        assert_eq!(c.data_id, None);
+        assert_eq!(c.application_id, TITLE_ID);
+        assert_eq!(c.required_system_version, Some(0x0003_0000));
+        assert_eq!((c.contents[0].content_type, c.contents[0].id_offset), (CT_PROGRAM, 1));
     }
 }

@@ -12,7 +12,8 @@
 //!   (a mix of stored, zero and LZ4 entries behind a bucket tree), written from the format description rather than
 //!   from the reader in `compressed`.
 //! * [`MetaBuilder`] makes the `.cnmt.nca` that describes a title and lists its other NCAs.
-//! * [`NspBuilder`] packs NCAs (and any other files) into an NSP, which `scan::scan_file` reads back.
+//! * [`build_ncz`] stores an NCA as NCZ (one zstd stream or independent blocks) the way nsz does.
+//! * [`NspBuilder`] packs NCAs (and any other files, also NCZs) into an NSP, which `scan::scan_file` reads back.
 //!
 //! The hash tables inside sections (SHA-256 blocks, IVFC levels), the NCA signatures and the cnmt digest are
 //! zero-filled: the layout fields that locate the data are right, but nothing in the crate verifies the hashes.
@@ -1239,13 +1240,39 @@ impl MetaBuilder {
         Self { meta_type: META_PATCH, title_id, version, ext_header, records: Vec::new() }
     }
 
-    /// Lists `nca` as content of type `record_type` (`cnmt::CT_*`).
-    pub fn content(mut self, nca: &BuiltNca, record_type: u8) -> Self {
+    /// The meta of a DLC (`META_ADD_ON_CONTENT`, extended header of 0x10 bytes: the application id, the required
+    /// application version (0), content accessibilities and reserved bytes (0)). A DLC's title id is chosen freely
+    /// (in practice its application's with 0x1000 and an index added), so it's a parameter.
+    pub fn add_on_content(title_id: u64, application_id: u64, version: u32) -> Self {
+        let mut ext_header = vec![0u8; 0x10];
+        put_u64(&mut ext_header, 0, application_id);
+        Self { meta_type: META_ADD_ON_CONTENT, title_id, version, ext_header, records: Vec::new() }
+    }
+
+    /// The meta of a DLC update (`META_DATA_PATCH`, extended header of 0x20 bytes: the id of the DLC being updated,
+    /// the application id, the required application version (0), the size of the extended data (none), reserved).
+    /// The title id of a data patch isn't derived from the DLC's by any rule, so it's a parameter.
+    pub fn data_patch(title_id: u64, data_id: u64, application_id: u64, version: u32) -> Self {
+        let mut ext_header = vec![0u8; 0x20];
+        put_u64(&mut ext_header, 0, data_id);
+        put_u64(&mut ext_header, 8, application_id);
+        Self { meta_type: META_DATA_PATCH, title_id, version, ext_header, records: Vec::new() }
+    }
+
+    /// Lists `nca` as content of type `record_type` (`cnmt::CT_*`), with id offset 0.
+    pub fn content(self, nca: &BuiltNca, record_type: u8) -> Self {
+        self.content_at(nca, record_type, 0)
+    }
+
+    /// Lists `nca` as content of type `record_type` (`cnmt::CT_*`) with the given id offset (which program of a
+    /// multi-program title it belongs to).
+    pub fn content_at(mut self, nca: &BuiltNca, record_type: u8, id_offset: u8) -> Self {
         let mut r = [0u8; 0x38];
         r[..0x20].copy_from_slice(&nca.hash);
         r[0x20..0x30].copy_from_slice(&nca.content_id);
         r[0x30..0x36].copy_from_slice(&(nca.bytes.len() as u64).to_le_bytes()[..6]);
         r[0x36] = record_type;
+        r[0x37] = id_offset;
         self.records.push(r);
         self
     }
@@ -1303,6 +1330,97 @@ pub fn build_nacp(title: &str, publisher: &str, display_version: &str) -> Vec<u8
 }
 
 // ---------------------------------------------------------------------------------------------------------
+// NCZ
+// ---------------------------------------------------------------------------------------------------------
+
+// The NCZ layout is restated here from the format nsz writes instead of imported from `ncz.rs`, so this is an
+// independent description that the reader gets checked against:
+//
+//     [0, 0x4000)       the NCA as it is (encrypted), header and all
+//     "NCZSECTN"        u64 section count, then 0x40 bytes per section: u64 offset, u64 size, u64 crypto type,
+//                       u64 padding, 16-byte key, 16-byte counter (the section nonce, then 8 bytes of zeros)
+//     "NCZBLOCK"        optional: bytes 8..12 are version, type, 0 and the block size exponent, then a u32 block
+//                       count, a u64 decompressed size and a u32 compressed size per block
+//     the rest          zstd-compressed plaintext of NCA bytes 0x4000.., one stream, or one frame per block (a block
+//                       that doesn't get smaller is stored as it is)
+
+/// The part of an NCA an NCZ keeps uncompressed.
+const NCZ_HEAD: usize = 0x4000;
+
+/// How an NCZ stores its compressed bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NczMode {
+    /// One zstd stream.
+    Stream,
+    /// An `NCZBLOCK` header and independently compressed blocks of `1 << exponent` bytes (the last may be shorter).
+    Block(u8),
+}
+
+/// The NCZ of `nca`, as nsz makes it. Sections encrypted with AES-CTR or as update (BKTR) sections have the
+/// section's plain counter taken off, which for a BKTR section is not its true plaintext: that depends on the
+/// AesCtrEx regions. Restoring the NCA takes the same counter off again, so it comes back whatever the section holds.
+/// `nca` must be bigger than the 0x4000 bytes an NCZ keeps as they are.
+pub fn build_ncz(nca: &BuiltNca, keys: &Keys, mode: NczMode) -> Vec<u8> {
+    assert!(nca.bytes.len() > NCZ_HEAD, "an NCA of {:#x} bytes is all head, nothing to compress", nca.bytes.len());
+    let header = NcaHeader::decrypt(&nca.bytes, keys).expect("an NCA the test keys can decrypt");
+    let mut plain = nca.bytes[NCZ_HEAD..].to_vec();
+    let mut table = Vec::new();
+    for s in header.sections() {
+        let (start, end) = (s.start.max(NCZ_HEAD as u64), s.end.min(nca.bytes.len() as u64));
+        if start >= end {
+            continue; // inside the head
+        }
+        let crypto = header.section_crypto(s.index);
+        let mut entry = [0u8; 0x40];
+        put_u64(&mut entry, 0, start);
+        put_u64(&mut entry, 8, end - start);
+        put_u64(&mut entry, 0x10, u64::from(crypto));
+        if crypto == CRYPT_CTR || crypto == CRYPT_BKTR {
+            let key = header.section_key(keys, None).expect("a section key without a ticket");
+            let nonce = header.section_nonce(s.index);
+            entry[0x20..0x30].copy_from_slice(&key);
+            entry[0x30..0x38].copy_from_slice(&nonce);
+            let bytes = &mut plain[start as usize - NCZ_HEAD..end as usize - NCZ_HEAD];
+            Ctr::new(&key, nonce).apply(start, bytes);
+        }
+        table.extend_from_slice(&entry);
+    }
+
+    let mut out = nca.bytes[..NCZ_HEAD].to_vec();
+    out.extend_from_slice(b"NCZSECTN");
+    out.extend_from_slice(&((table.len() / 0x40) as u64).to_le_bytes());
+    out.extend_from_slice(&table);
+    match mode {
+        NczMode::Stream => out.extend_from_slice(&zstd::bulk::compress(&plain, 3).expect("compressing")),
+        NczMode::Block(exponent) => {
+            assert!((1..=32).contains(&exponent), "block size exponent {exponent}");
+            let blocks: Vec<Vec<u8>> = plain
+                .chunks(1usize << exponent)
+                .map(|block| {
+                    let packed = zstd::bulk::compress(block, 3).expect("compressing");
+                    if packed.len() < block.len() {
+                        packed
+                    } else {
+                        block.to_vec()
+                    }
+                })
+                .collect();
+            out.extend_from_slice(b"NCZBLOCK");
+            out.extend_from_slice(&[2, 1, 0, exponent]);
+            out.extend_from_slice(&(blocks.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(plain.len() as u64).to_le_bytes());
+            for block in &blocks {
+                out.extend_from_slice(&(block.len() as u32).to_le_bytes());
+            }
+            for block in &blocks {
+                out.extend_from_slice(block);
+            }
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------------------------------------
 // NSP
 // ---------------------------------------------------------------------------------------------------------
 
@@ -1328,6 +1446,13 @@ impl NspBuilder {
         self.file(&nca.file_name(), nca.bytes.clone())
     }
 
+    /// Adds `nca` as an NCZ (see [`build_ncz`]) under `<content id>.ncz`, where a scan looks for content that has no
+    /// `.nca`. Not for a meta NCA, which an NSZ keeps as it is.
+    pub fn ncz(self, nca: &BuiltNca, keys: &Keys, mode: NczMode) -> Self {
+        assert_ne!(nca.content_type, NcaContentType::Meta, "a meta NCA isn't compressed");
+        self.file(&format!("{}.ncz", nca.content_id_hex()), build_ncz(nca, keys, mode))
+    }
+
     pub fn build(&self) -> Vec<u8> {
         let files: Vec<(&str, &[u8])> = self.files.iter().map(|(n, d)| (n.as_str(), d.as_slice())).collect();
         build_pfs0(&files)
@@ -1348,6 +1473,79 @@ mod tests {
 
     fn u64_at(b: &[u8], at: usize) -> u64 {
         u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
+    }
+
+    #[test]
+    fn ncz_keeps_the_head_and_holds_the_rest_decrypted() {
+        use crate::ncz::NczInfo;
+
+        let tmp = TempDir::new("testutil-ncz");
+        let keys = TestKeys::keys(&tmp.path().join("keys"));
+        let exefs = Section::pfs0(&[("main", &pattern(30_000, 1)), ("main.npdm", &[0x55; 5000])]);
+        let romfs = Section::romfs(romfs_image_of(&[("a/data.bin", pattern(40_000, 2)), ("zeros.bin", vec![0; 9000])]));
+        let nca = NcaBuilder::new(NcaContentType::Program, 0x0100_0000_0001_0000)
+            .section(exefs.clone())
+            .section(romfs.clone())
+            .build(&keys);
+        // What the NCA holds from the end of the head on, decrypted: the sections' plaintext, one after the other.
+        let mut plain = vec![0u8; HEADER_SIZE];
+        plain.extend(exefs.plaintext());
+        plain.extend(romfs.plaintext());
+        assert_eq!(plain.len(), nca.bytes.len());
+        assert!(plain.len() > 3 * NCZ_HEAD);
+
+        for (n, mode) in [NczMode::Stream, NczMode::Block(14), NczMode::Block(12)].into_iter().enumerate() {
+            let ncz = build_ncz(&nca, &keys, mode);
+            assert!(ncz.len() < nca.bytes.len(), "{mode:?}: {} bytes for {}", ncz.len(), nca.bytes.len());
+            assert_eq!(ncz[..NCZ_HEAD], nca.bytes[..NCZ_HEAD]);
+            let path = tmp.path().join(format!("{n}.ncz"));
+            fs::write(&path, &ncz).unwrap();
+
+            let mut file = fs::File::open(&path).unwrap();
+            let info = NczInfo::parse(&mut file, 0, ncz.len() as u64).expect("parsing the NCZ");
+            // Two sections; the first starts inside the head, so its entry starts where the compressed bytes do.
+            let sections: Vec<(u64, u64, u64)> =
+                info.sections.iter().map(|s| (s.offset, s.size, s.crypto_type)).collect();
+            let first_end = (HEADER_SIZE + exefs.plaintext().len()) as u64;
+            let ctr = u64::from(CRYPT_CTR);
+            assert_eq!(
+                sections,
+                [
+                    (NCZ_HEAD as u64, first_end - NCZ_HEAD as u64, ctr),
+                    (first_end, nca.bytes.len() as u64 - first_end, ctr)
+                ]
+            );
+            assert_eq!(
+                info.block.as_ref().map(|b| b.block_size),
+                match mode {
+                    NczMode::Stream => None,
+                    NczMode::Block(exp) => Some(1u64 << exp),
+                }
+            );
+
+            let mut body = Vec::new();
+            info.decompress(&file, nca.bytes.len() as u64, &mut |chunk| {
+                body.extend_from_slice(chunk);
+                Ok(())
+            })
+            .expect("decompressing");
+            assert!(body == plain[NCZ_HEAD..], "{mode:?}: the decompressed bytes are the sections' plaintext");
+
+            // Encrypting them again gives the NCA back.
+            let mut restored = ncz[..NCZ_HEAD].to_vec();
+            info.reencrypt(NCZ_HEAD as u64, &mut body);
+            restored.extend(body);
+            assert!(restored == nca.bytes, "{mode:?}: the restored NCA is the original");
+        }
+    }
+
+    /// A RomFS image of `files`.
+    fn romfs_image_of(files: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        let mut image = ImageBuilder::new();
+        for (path, data) in files {
+            image.file(path, data);
+        }
+        image.build()
     }
 
     #[test]

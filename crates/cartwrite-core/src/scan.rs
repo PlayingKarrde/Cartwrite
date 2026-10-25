@@ -51,6 +51,8 @@ pub struct NcaRef {
     pub out_name: String,
     /// cnmt content type (`cnmt::CT_*`).
     pub content_type: u8,
+    /// Which program of a multi-program title this belongs to (cnmt content record id_offset; 0 for most titles).
+    pub id_offset: u8,
     pub key_generation: u8,
     pub rights_id: Option<[u8; 16]>,
 }
@@ -59,6 +61,8 @@ pub struct NcaRef {
 pub struct Title {
     pub title_id: u64,
     pub application_id: u64,
+    /// For a DLC update (data patch): the DLC title it updates (DataPatchMetaExtendedHeader DataId, at ext+0).
+    pub data_id: Option<u64>,
     pub version: u32,
     pub kind: TitleKind,
     pub required_system_version: Option<u32>,
@@ -215,6 +219,7 @@ fn read_title(
         is_ncz: false,
         out_name: meta_entry.name.clone(),
         content_type: cnmt::CT_META,
+        id_offset: 0,
         key_generation: header.key_generation(),
         rights_id: None,
     };
@@ -243,6 +248,7 @@ fn read_title(
             is_ncz,
             out_name: format!("{id}.nca"),
             content_type: rec.content_type,
+            id_offset: rec.id_offset,
             key_generation: h.key_generation(),
             rights_id: h.has_rights_id().then(|| h.rights_id()),
         });
@@ -251,6 +257,7 @@ fn read_title(
     let mut title = Title {
         title_id: cnmt.title_id,
         application_id: cnmt.application_id,
+        data_id: cnmt.data_id,
         version: cnmt.version,
         kind: kind_t,
         required_system_version: cnmt.required_system_version,
@@ -336,4 +343,99 @@ fn read_control(f: &mut File, n: &NcaRef, title: &Title, keys: &Keys) -> Result<
         _ => None,
     };
     Ok((nacp, icon))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::{
+        pattern, BuiltNca, ImageBuilder, MetaBuilder, NcaBuilder, NspBuilder, Section, TempDir, TestKeys,
+    };
+
+    const APP_ID: u64 = 0x0100_0000_0001_0000;
+
+    fn data_nca(keys: &Keys, title_id: u64, seed: u64) -> BuiltNca {
+        let mut image = ImageBuilder::new();
+        image.file("data.bin", &pattern(3000, seed));
+        NcaBuilder::new(NcaContentType::Data, title_id).section(Section::romfs(image.build())).build(keys)
+    }
+
+    fn program_nca(keys: &Keys, title_id: u64, seed: u64) -> BuiltNca {
+        let exefs = pattern(2000, seed);
+        NcaBuilder::new(NcaContentType::Program, title_id).section(Section::pfs0(&[("main", &exefs)])).build(keys)
+    }
+
+    #[test]
+    fn data_patch_is_a_dlc_update_that_names_its_dlc() {
+        const DLC_ID: u64 = APP_ID + 0x1001;
+        const PATCH_ID: u64 = APP_ID + 0x1801;
+        let tmp = TempDir::new("scan-data-patch");
+        let keys = TestKeys::keys(tmp.path());
+
+        let data = data_nca(&keys, PATCH_ID, 1);
+        let meta =
+            MetaBuilder::data_patch(PATCH_ID, DLC_ID, APP_ID, 0x2_0000).content(&data, cnmt::CT_DATA).build(&keys);
+        let nsp = tmp.path().join("dlc update.nsp");
+        NspBuilder::new().nca(&data).nca(&meta).write(&nsp);
+
+        let titles = scan_file(&nsp, &keys).expect("scanning the NSP");
+        assert_eq!(titles.len(), 1);
+        let t = &titles[0];
+        assert_eq!(t.kind, TitleKind::DlcUpdate);
+        assert_eq!(t.data_id, Some(DLC_ID));
+        assert_eq!((t.title_id, t.application_id, t.version), (PATCH_ID, APP_ID, 0x2_0000));
+        assert_eq!(t.required_system_version, None);
+        assert_eq!(t.contents.len(), 1);
+        assert_eq!((t.contents[0].content_type, t.contents[0].id_offset), (cnmt::CT_DATA, 0));
+        assert!(t.source_complete);
+        assert!(t.warnings.is_empty(), "{:?}", t.warnings);
+    }
+
+    #[test]
+    fn dlc_has_no_data_id() {
+        const DLC_ID: u64 = APP_ID + 0x1001;
+        let tmp = TempDir::new("scan-dlc");
+        let keys = TestKeys::keys(tmp.path());
+
+        let data = data_nca(&keys, DLC_ID, 2);
+        let meta = MetaBuilder::add_on_content(DLC_ID, APP_ID, 0).content(&data, cnmt::CT_DATA).build(&keys);
+        let nsp = tmp.path().join("dlc.nsp");
+        NspBuilder::new().nca(&data).nca(&meta).write(&nsp);
+
+        let titles = scan_file(&nsp, &keys).expect("scanning the NSP");
+        assert_eq!(titles.len(), 1);
+        let t = &titles[0];
+        assert_eq!(t.kind, TitleKind::Dlc);
+        assert_eq!(t.data_id, None);
+        assert_eq!((t.title_id, t.application_id), (DLC_ID, APP_ID));
+        assert_eq!(t.contents.len(), 1);
+        assert!(t.warnings.is_empty(), "{:?}", t.warnings);
+    }
+
+    #[test]
+    fn content_records_keep_their_id_offset() {
+        let tmp = TempDir::new("scan-id-offset");
+        let keys = TestKeys::keys(tmp.path());
+
+        let first = program_nca(&keys, APP_ID, 3);
+        let second = program_nca(&keys, APP_ID, 4);
+        let data = data_nca(&keys, APP_ID, 5);
+        let meta = MetaBuilder::application(APP_ID, 0, 0x0001_0000)
+            .content(&first, cnmt::CT_PROGRAM)
+            .content_at(&second, cnmt::CT_PROGRAM, 1)
+            .content(&data, cnmt::CT_DATA)
+            .build(&keys);
+        let nsp = tmp.path().join("two programs.nsp");
+        NspBuilder::new().nca(&first).nca(&second).nca(&data).nca(&meta).write(&nsp);
+
+        let titles = scan_file(&nsp, &keys).expect("scanning the NSP");
+        assert_eq!(titles.len(), 1);
+        let t = &titles[0];
+        assert_eq!(t.kind, TitleKind::Base);
+        assert_eq!(t.data_id, None);
+        assert!(t.warnings.is_empty(), "{:?}", t.warnings);
+        let found: Vec<(u8, u8)> = t.contents.iter().map(|n| (n.content_type, n.id_offset)).collect();
+        assert_eq!(found, [(cnmt::CT_PROGRAM, 0), (cnmt::CT_PROGRAM, 1), (cnmt::CT_DATA, 0)]);
+        assert_eq!(t.meta.id_offset, 0);
+    }
 }
