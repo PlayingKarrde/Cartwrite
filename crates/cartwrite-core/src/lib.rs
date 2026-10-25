@@ -4,6 +4,7 @@
 pub mod bktr;
 pub mod build;
 pub mod cnmt;
+pub mod compressed;
 pub mod container;
 pub mod crypto;
 pub mod error;

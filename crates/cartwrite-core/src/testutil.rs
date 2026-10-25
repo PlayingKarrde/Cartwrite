@@ -8,6 +8,9 @@
 //!   sections, key generation 0).
 //! * [`PatchSection`] makes the RomFS section of an update (an AesCtrEx bucket tree over an indirect bucket tree over
 //!   pieces of the base game's section), written from the format description rather than from the reader in `bktr`.
+//! * [`Section::compressed`] and [`PatchSection::compressed`] store a section's data level as compressed storage
+//!   (a mix of stored, zero and LZ4 entries behind a bucket tree), written from the format description rather than
+//!   from the reader in `compressed`.
 //! * [`MetaBuilder`] makes the `.cnmt.nca` that describes a title and lists its other NCAs.
 //! * [`NspBuilder`] packs NCAs (and any other files) into an NSP, which `scan::scan_file` reads back.
 //!
@@ -342,6 +345,19 @@ pub enum Section {
     /// The RomFS of an update: only what changed since the base game, stored with AesCtrEx encryption
     /// (FS header: encryption type 4, patch info at 0x100).
     Patch(Box<PatchSection>),
+    /// A PFS0 or RomFS section whose data level (what the hash layer covers) is compressed storage: the stored
+    /// data, then the bucket tree that maps the image onto it (FS header: compression info at 0x178).
+    Compressed(Box<CompressedSection>),
+}
+
+/// A PFS0 or RomFS image to be stored as compressed storage; see [`Section::compressed`].
+#[derive(Clone)]
+pub struct CompressedSection {
+    /// True for a PFS0 image, false for a RomFS image.
+    pfs0: bool,
+    image: Vec<u8>,
+    block_size: usize,
+    kinds: Vec<Compress>,
 }
 
 impl Section {
@@ -360,6 +376,28 @@ impl Section {
         Self::Patch(Box::new(patch))
     }
 
+    /// Stores this PFS0 or RomFS section's data level as compressed storage: the image is cut into blocks of
+    /// `block_size` bytes (the last may be shorter), each stored the way `kinds` says, cycling through it (see
+    /// [`compress_level`]). The hash layer then covers the compressed data and its table, and the FS header holds
+    /// the compression info. Read back, the section yields the same image.
+    pub fn compressed(self, block_size: usize, kinds: &[Compress]) -> Self {
+        let (pfs0, image) = match self {
+            Self::Pfs0(image) => (true, image),
+            Self::RomFs(image) => (false, image),
+            Self::Patch(_) | Self::Compressed(_) => panic!("only a plain PFS0 or RomFS section can be compressed"),
+        };
+        assert!(block_size > 0 && !kinds.is_empty() && !image.is_empty());
+        Self::Compressed(Box::new(CompressedSection { pfs0, image, block_size, kinds: kinds.to_vec() }))
+    }
+
+    /// For a [`compressed`](Self::compressed) section, how its data level is stored.
+    pub fn compression(&self) -> Option<CompressedLevel> {
+        match self {
+            Self::Compressed(c) => Some(compress_level(&c.image, c.block_size, &c.kinds)),
+            _ => None,
+        }
+    }
+
     /// The section's bytes as the NCA holds them before encryption (hash tables followed by the data, padded to
     /// [`SECTION_ALIGN`]): for a base game's RomFS section, what a patch is made against. Not for patch sections,
     /// whose stored bytes aren't a single plaintext.
@@ -372,52 +410,60 @@ impl Section {
     fn layout(&self, fs: &mut [u8]) -> Vec<u8> {
         put_u16(fs, 0, 2); // version
         fs[4] = CRYPT_CTR;
-        let mut out;
-        match self {
+        let (pfs0, image) = match self {
             Self::Patch(_) => unreachable!("an update section is assembled by NcaBuilder::build, not laid out"),
-            Self::Pfs0(image) => {
-                const BLOCK_SIZE: usize = 0x1000;
-                fs[2] = FS_PFS0;
-                fs[3] = HASH_SHA256;
-                let hash_table_size = image.len().div_ceil(BLOCK_SIZE).max(1) * 0x20;
-                let data_offset = hash_table_size.next_multiple_of(SECTION_ALIGN);
-                put_u32(fs, 0x28, BLOCK_SIZE as u32);
-                put_u32(fs, 0x2C, 2); // layers
-                put_u64(fs, 0x30, 0); // hash table offset
-                put_u64(fs, 0x38, hash_table_size as u64);
-                put_u64(fs, 0x40, data_offset as u64);
-                put_u64(fs, 0x48, image.len() as u64);
-                out = vec![0u8; data_offset];
-                out.extend_from_slice(image);
+            Self::Pfs0(image) => (true, image),
+            Self::RomFs(image) => (false, image),
+            Self::Compressed(c) => (c.pfs0, &c.image),
+        };
+        // The data level: the image itself, or its compressed storage, which the hash layer then covers.
+        let compressed = self.compression();
+        let level: &[u8] = compressed.as_ref().map_or(image, |c| &c.level);
+        if let Some(c) = &compressed {
+            c.write_info(fs);
+        }
+        let mut out;
+        if pfs0 {
+            const BLOCK_SIZE: usize = 0x1000;
+            fs[2] = FS_PFS0;
+            fs[3] = HASH_SHA256;
+            let hash_table_size = level.len().div_ceil(BLOCK_SIZE).max(1) * 0x20;
+            let data_offset = hash_table_size.next_multiple_of(SECTION_ALIGN);
+            put_u32(fs, 0x28, BLOCK_SIZE as u32);
+            put_u32(fs, 0x2C, 2); // layers
+            put_u64(fs, 0x30, 0); // hash table offset
+            put_u64(fs, 0x38, hash_table_size as u64);
+            put_u64(fs, 0x40, data_offset as u64);
+            put_u64(fs, 0x48, level.len() as u64);
+            out = vec![0u8; data_offset];
+            out.extend_from_slice(level);
+        } else {
+            const LEVELS: usize = 6; // five hash levels, then the data
+            const BLOCK_LOG2: u32 = 14;
+            let block = 1usize << BLOCK_LOG2;
+            fs[2] = FS_ROMFS;
+            fs[3] = HASH_IVFC;
+            // Each hash level holds one 0x20-byte hash per block of the level below it.
+            let mut sizes = [level.len(); LEVELS];
+            for i in (0..LEVELS - 1).rev() {
+                sizes[i] = sizes[i + 1].div_ceil(block).max(1) * 0x20;
             }
-            Self::RomFs(image) => {
-                const LEVELS: usize = 6; // five hash levels, then the data
-                const BLOCK_LOG2: u32 = 14;
-                let block = 1usize << BLOCK_LOG2;
-                fs[2] = FS_ROMFS;
-                fs[3] = HASH_IVFC;
-                // Each hash level holds one 0x20-byte hash per block of the level below it.
-                let mut sizes = [image.len(); LEVELS];
-                for i in (0..LEVELS - 1).rev() {
-                    sizes[i] = sizes[i + 1].div_ceil(block).max(1) * 0x20;
-                }
-                let mut offsets = [0usize; LEVELS];
-                for i in 1..LEVELS {
-                    offsets[i] = (offsets[i - 1] + sizes[i - 1]).next_multiple_of(block);
-                }
-                fs[8..12].copy_from_slice(b"IVFC");
-                put_u32(fs, 0x0C, 0x20000); // magic number
-                put_u32(fs, 0x10, 0x20); // master hash size
-                put_u32(fs, 0x14, LEVELS as u32 + 1); // the count includes the master hash
-                for i in 0..LEVELS {
-                    let e = 0x18 + i * 0x18;
-                    put_u64(fs, e, offsets[i] as u64);
-                    put_u64(fs, e + 8, sizes[i] as u64);
-                    put_u32(fs, e + 0x10, BLOCK_LOG2);
-                }
-                out = vec![0u8; offsets[LEVELS - 1]];
-                out.extend_from_slice(image);
+            let mut offsets = [0usize; LEVELS];
+            for i in 1..LEVELS {
+                offsets[i] = (offsets[i - 1] + sizes[i - 1]).next_multiple_of(block);
             }
+            fs[8..12].copy_from_slice(b"IVFC");
+            put_u32(fs, 0x0C, 0x20000); // magic number
+            put_u32(fs, 0x10, 0x20); // master hash size
+            put_u32(fs, 0x14, LEVELS as u32 + 1); // the count includes the master hash
+            for i in 0..LEVELS {
+                let e = 0x18 + i * 0x18;
+                put_u64(fs, e, offsets[i] as u64);
+                put_u64(fs, e + 8, sizes[i] as u64);
+                put_u32(fs, e + 0x10, BLOCK_LOG2);
+            }
+            out = vec![0u8; offsets[LEVELS - 1]];
+            out.extend_from_slice(level);
         }
         pad_to(&mut out, SECTION_ALIGN);
         out
@@ -685,8 +731,12 @@ pub struct PatchSection {
     base: Vec<u8>,
     /// The patched section: IVFC hash levels and the new RomFS image.
     target: Vec<u8>,
+    /// The new RomFS image, before any compression.
+    image: Vec<u8>,
     /// The first 0x100 bytes of the FS header (version, types, IVFC levels), which locate the RomFS in `target`.
     fs_prefix: Vec<u8>,
+    /// The FS header's compression info (0x178..0x1A0), if `target`'s data level is compressed storage.
+    compression_info: Option<Vec<u8>>,
     chunk: usize,
     merge: bool,
     generation: u32,
@@ -706,7 +756,9 @@ impl PatchSection {
         Self {
             base: base_section.to_vec(),
             target,
+            image: new_romfs_image.to_vec(),
             fs_prefix: fs[..0x100].to_vec(),
+            compression_info: None,
             chunk: 0x1000,
             merge: true,
             generation: 4,
@@ -715,6 +767,18 @@ impl PatchSection {
             region_pattern: vec![(1, true), (2, true), (3, false), (6, true)],
             gap: 0x200,
         }
+    }
+
+    /// Stores the patched section's data level (what its IVFC header locates) as compressed storage, as
+    /// [`Section::compressed`] does for a plain section: the update then carries the compressed data and its table
+    /// where the new RomFS image would be, and reading the patched section through them yields the same image. The
+    /// base game's section stays whatever it is; the patch is made against it as given.
+    pub fn compressed(mut self, block_size: usize, kinds: &[Compress]) -> Self {
+        let mut fs = [0u8; 0x200];
+        self.target = Section::RomFs(self.image.clone()).compressed(block_size, kinds).layout(&mut fs);
+        self.fs_prefix = fs[..0x100].to_vec();
+        self.compression_info = Some(fs[COMPRESSION_INFO..COMPRESSION_INFO + COMPRESSION_INFO_SIZE].to_vec());
+        self
     }
 
     /// Diffs in chunks of `bytes`: a chunk is read from the base game if the base has the same bytes at a multiple
@@ -837,7 +901,7 @@ impl PatchSection {
     }
 
     /// Fills in the FS header `fs`: encryption type 4, the IVFC levels of the patched section, the patch info
-    /// (0x100..0x140) and the generation and secure value (0x140, 0x144).
+    /// (0x100..0x140), the generation and secure value (0x140, 0x144) and the compression info, if any.
     fn write_fs_header(&self, layout: &PatchLayout, fs: &mut [u8]) {
         fs[..0x100].copy_from_slice(&self.fs_prefix);
         fs[4] = CRYPT_BKTR;
@@ -849,6 +913,9 @@ impl PatchSection {
         fs[0x130..0x140].copy_from_slice(&bucket_tree_header(layout.regions.len()));
         put_u32(fs, 0x140, self.generation);
         put_u32(fs, 0x144, self.secure_value);
+        if let Some(info) = &self.compression_info {
+            fs[COMPRESSION_INFO..COMPRESSION_INFO + COMPRESSION_INFO_SIZE].copy_from_slice(info);
+        }
     }
 
     /// The section as stored in an NCA, where it starts at absolute offset `start`: every encrypted AesCtrEx
@@ -870,6 +937,166 @@ impl PatchSection {
         stored.extend_from_slice(&table);
         stored
     }
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Compressed storage
+// ---------------------------------------------------------------------------------------------------------
+
+// The layout is restated here from Atmosphere's `CompressedStorage` instead of imported from `compressed.rs`, so
+// this is an independent description that the reader gets checked against. A compressed data level is
+//
+//     [0, table_offset)                 the stored data: blocks in any order, with gaps between them
+//     [table_offset, + table_size)      a bucket tree of 0x18-byte entries
+//
+// and the decompressed image is as long as the tree's end offset. An entry covers the image from its virtual offset
+// to the next entry's (or the end) and says where and how that range is stored. The FS header holds the table's
+// offset and size (0x178, 0x180) and the bucket tree header (0x188).
+
+/// Where the FS header keeps its compression info, and how long it is: table offset, table size, bucket tree
+/// header, reserved.
+const COMPRESSION_INFO: usize = 0x178;
+const COMPRESSION_INFO_SIZE: usize = 0x28;
+
+/// Compression type 0: the range is stored as is.
+pub const CMP_NONE: u8 = 0;
+/// Compression type 1: the range is all zeros, and nothing is stored for it.
+pub const CMP_ZEROS: u8 = 1;
+/// Compression type 3: the range is one raw LZ4 block (no frame) of `physical_size` bytes, 16-byte aligned.
+pub const CMP_LZ4: u8 = 3;
+
+/// How [`compress_level`] stores one block of the image.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Compress {
+    /// As is (type 0).
+    Stored,
+    /// As nothing (type 1), if the block is all zeros; any other block is stored as `Lz4`.
+    Zeros,
+    /// As an LZ4 block (type 3), however well that compresses.
+    Lz4,
+}
+
+/// One entry of a compressed storage's table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompressedEntry {
+    pub virtual_offset: u64,
+    /// Bytes of the image the entry covers. The table itself doesn't store this.
+    pub len: u64,
+    /// [`CMP_NONE`], [`CMP_ZEROS`] or [`CMP_LZ4`].
+    pub compression_type: u8,
+    pub physical_offset: u64,
+    pub physical_size: u32,
+}
+
+/// An image stored as a compressed data level; see [`compress_level`].
+#[derive(Clone)]
+pub struct CompressedLevel {
+    /// The data level: the stored data, then the table.
+    pub level: Vec<u8>,
+    pub table_offset: u64,
+    pub table_size: u64,
+    pub entries: Vec<CompressedEntry>,
+}
+
+impl CompressedLevel {
+    /// Fills in the compression info of the FS header `fs`.
+    fn write_info(&self, fs: &mut [u8]) {
+        put_u64(fs, COMPRESSION_INFO, self.table_offset);
+        put_u64(fs, COMPRESSION_INFO + 8, self.table_size);
+        fs[COMPRESSION_INFO + 0x10..COMPRESSION_INFO + 0x20].copy_from_slice(&bucket_tree_header(self.entries.len()));
+    }
+
+    /// The image the entries describe, worked out by following each one by the book.
+    pub fn decompress(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        for e in &self.entries {
+            assert_eq!(out.len() as u64, e.virtual_offset, "entries are contiguous");
+            let (at, size) = (e.physical_offset as usize, e.physical_size as usize);
+            match e.compression_type {
+                CMP_NONE => out.extend_from_slice(&self.level[at..at + e.len as usize]),
+                CMP_ZEROS => out.resize(out.len() + e.len as usize, 0),
+                CMP_LZ4 => {
+                    assert_eq!(at % 16, 0, "LZ4 blocks are 16-byte aligned");
+                    let block = lz4_flex::block::decompress(&self.level[at..at + size], e.len as usize)
+                        .expect("a valid LZ4 block");
+                    assert_eq!(block.len() as u64, e.len, "the block decompresses to exactly the range");
+                    out.extend_from_slice(&block);
+                }
+                t => panic!("compression type {t}"),
+            }
+        }
+        out
+    }
+}
+
+/// A compressed-storage table entry (0x18 bytes): where the range starts in the image, where its stored bytes start
+/// in the data before the table, how it is stored, and how long the stored bytes are.
+pub fn compression_entry(
+    virtual_offset: u64,
+    physical_offset: u64,
+    compression_type: u8,
+    physical_size: u32,
+) -> Vec<u8> {
+    let mut e = vec![0u8; 0x18];
+    put_u64(&mut e, 0, virtual_offset);
+    put_u64(&mut e, 8, physical_offset);
+    e[0x10] = compression_type;
+    put_u32(&mut e, 0x14, physical_size);
+    e
+}
+
+/// Stores `image` as a compressed data level. It is cut into blocks of `block_size` bytes (the last may be shorter),
+/// and block `i` is stored as `kinds[i % kinds.len()]` says (a `Zeros` block that isn't all zeros becomes `Lz4`),
+/// one table entry per block. The stored data follows the blocks' order, with small gaps of filler between them: LZ4
+/// blocks start on 16-byte boundaries, so do every other stored block, and the rest start wherever the previous one
+/// left off. A zeros entry points at the end of the data stored so far.
+pub fn compress_level(image: &[u8], block_size: usize, kinds: &[Compress]) -> CompressedLevel {
+    assert!(block_size > 0 && !kinds.is_empty() && !image.is_empty());
+    // Never zero, so that reading the filler instead of a block can't pass for zeros.
+    const FILLER: u8 = 0xA5;
+    let mut data: Vec<u8> = Vec::new();
+    let mut entries = Vec::new();
+    for (i, block) in image.chunks(block_size).enumerate() {
+        let mut kind = kinds[i % kinds.len()];
+        if kind == Compress::Zeros && block.iter().any(|&b| b != 0) {
+            kind = Compress::Lz4;
+        }
+        data.resize(data.len() + [0, 3, 0, 16, 5][i % 5], FILLER);
+        let (compression_type, physical_offset, physical_size) = match kind {
+            Compress::Zeros => (CMP_ZEROS, data.len(), 0),
+            Compress::Stored => {
+                if i % 2 == 0 {
+                    data.resize(data.len().next_multiple_of(16), FILLER);
+                }
+                let at = data.len();
+                data.extend_from_slice(block);
+                (CMP_NONE, at, block.len())
+            }
+            Compress::Lz4 => {
+                data.resize(data.len().next_multiple_of(16), FILLER);
+                let at = data.len();
+                let packed = lz4_flex::block::compress(block);
+                data.extend_from_slice(&packed);
+                (CMP_LZ4, at, packed.len())
+            }
+        };
+        entries.push(CompressedEntry {
+            virtual_offset: (i * block_size) as u64,
+            len: block.len() as u64,
+            compression_type,
+            physical_offset: physical_offset as u64,
+            physical_size: physical_size as u32,
+        });
+    }
+    let encoded: Vec<Vec<u8>> = entries
+        .iter()
+        .map(|e| compression_entry(e.virtual_offset, e.physical_offset, e.compression_type, e.physical_size))
+        .collect();
+    let table = bucket_tree(&encoded, image.len() as u64);
+    data.resize(data.len().next_multiple_of(16), FILLER);
+    let table_offset = data.len() as u64;
+    data.extend_from_slice(&table);
+    CompressedLevel { level: data, table_offset, table_size: table.len() as u64, entries }
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -1005,5 +1232,93 @@ impl NspBuilder {
             fs::create_dir_all(parent).unwrap_or_else(|e| panic!("creating {}: {e}", parent.display()));
         }
         fs::write(path, self.build()).unwrap_or_else(|e| panic!("writing {}: {e}", path.display()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn u64_at(b: &[u8], at: usize) -> u64 {
+        u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
+    }
+
+    #[test]
+    fn compress_level_stores_each_block_the_way_it_was_asked_to() {
+        // Ten blocks of 0x300 bytes, the last one short. Blocks 2 and 5 are all zeros, block 8 isn't.
+        let mut image = pattern(10 * 0x300 - 0x45, 1);
+        image[2 * 0x300..3 * 0x300].fill(0);
+        image[5 * 0x300..6 * 0x300].fill(0);
+        let kinds = [Compress::Lz4, Compress::Stored, Compress::Zeros];
+        let c = compress_level(&image, 0x300, &kinds);
+
+        // Zeros where the block is zeros and asked for, LZ4 in its place where it isn't.
+        let types: Vec<u8> = c.entries.iter().map(|e| e.compression_type).collect();
+        assert_eq!(
+            types,
+            [CMP_LZ4, CMP_NONE, CMP_ZEROS, CMP_LZ4, CMP_NONE, CMP_ZEROS, CMP_LZ4, CMP_NONE, CMP_LZ4, CMP_LZ4]
+        );
+        for (i, e) in c.entries.iter().enumerate() {
+            assert_eq!(e.virtual_offset, i as u64 * 0x300);
+            assert_eq!(e.len, if i == 9 { 0x300 - 0x45 } else { 0x300 });
+            let (at, size) = (e.physical_offset as usize, e.physical_size as usize);
+            match e.compression_type {
+                CMP_NONE => assert_eq!(c.level[at..at + size], image[i * 0x300..][..e.len as usize]),
+                CMP_LZ4 => assert_eq!(at % 16, 0, "entry {i}"),
+                _ => assert_eq!(size, 0),
+            }
+        }
+        assert_eq!(c.entries[4].physical_offset % 16, 0, "stored blocks with an even index are aligned");
+        assert_eq!(c.decompress(), image);
+
+        // The table is a bucket tree of those entries, right after the stored data, with nothing after it.
+        let encoded: Vec<Vec<u8>> = c
+            .entries
+            .iter()
+            .map(|e| compression_entry(e.virtual_offset, e.physical_offset, e.compression_type, e.physical_size))
+            .collect();
+        assert_eq!(c.level[c.table_offset as usize..], bucket_tree(&encoded, image.len() as u64));
+        assert_eq!(c.table_size as usize, BUCKET_NODE_SIZE * 2);
+    }
+
+    #[test]
+    fn compressed_sections_hash_and_describe_the_compressed_level() {
+        let mut romfs = ImageBuilder::new();
+        romfs.file("a/data.bin", &pattern(9000, 1));
+        romfs.file("zeros.bin", &[0u8; 9000]);
+        let images = [(true, build_pfs0(&[("a", &pattern(9000, 2)), ("b", &[0u8; 9000])])), (false, romfs.build())];
+        for (pfs0, image) in images {
+            let plain = if pfs0 { Section::Pfs0(image.clone()) } else { Section::RomFs(image.clone()) };
+            let section = plain.clone().compressed(0x1000, &[Compress::Lz4, Compress::Zeros, Compress::Stored]);
+            let c = section.compression().expect("a compressed section");
+            assert!(plain.compression().is_none());
+            assert_eq!(c.decompress(), image);
+
+            // The hash layer's data level (the PFS0's data region, the last IVFC level) is the compressed storage.
+            let mut fs = [0u8; 0x200];
+            let bytes = section.layout(&mut fs);
+            let (offset, size) = if pfs0 {
+                (u64_at(&fs, 0x40), u64_at(&fs, 0x48))
+            } else {
+                (u64_at(&fs, 0x18 + 5 * 0x18), u64_at(&fs, 0x20 + 5 * 0x18))
+            };
+            assert_eq!(size, c.level.len() as u64);
+            assert_eq!(bytes[offset as usize..][..size as usize], c.level);
+            assert_eq!((u64_at(&fs, 0x178), u64_at(&fs, 0x180)), (c.table_offset, c.table_size));
+            assert_eq!(fs[0x188..0x198], bucket_tree_header(c.entries.len()));
+            assert!(fs[0x198..0x1A0].iter().all(|&b| b == 0));
+            assert_eq!(bytes, section.plaintext());
+
+            // A plain section has the image there, and no compression info.
+            let mut plain_fs = [0u8; 0x200];
+            let plain_bytes = plain.layout(&mut plain_fs);
+            let (offset, size) = if pfs0 {
+                (u64_at(&plain_fs, 0x40), u64_at(&plain_fs, 0x48))
+            } else {
+                (u64_at(&plain_fs, 0x18 + 5 * 0x18), u64_at(&plain_fs, 0x20 + 5 * 0x18))
+            };
+            assert_eq!(plain_bytes[offset as usize..][..size as usize], image);
+            assert!(plain_fs[0x178..0x1A0].iter().all(|&b| b == 0));
+        }
     }
 }

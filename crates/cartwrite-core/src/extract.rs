@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::bktr::{AesCtrExStorage, IndirectStorage, PatchInfo};
 use crate::build::Progress;
 use crate::cnmt;
+use crate::compressed::{CompressedStorage, CompressionInfo};
 use crate::container::{self, Entry};
 use crate::crypto::Key128;
 use crate::error::{fmt_err, Error, Result};
@@ -308,7 +309,21 @@ fn with_part_data<T>(keys: &Keys, source: &Source, f: impl FnOnce(&mut dyn Stora
     // The update's own IVFC header describes the patched section.
     let (offset, size) = nca::ivfc_data_level(&up.header, update.section)?;
     let mut data = SubStorage::new(&mut patched, offset, size)?;
-    f(&mut data)
+    decompressed(&mut data, &up.header, update.section, f)
+}
+
+/// Runs `f` on a section's data level, decompressed if the section uses compressed storage.
+/// For an update, the update's header decides (the base is read below this layer).
+fn decompressed<T>(
+    level: &mut dyn Storage,
+    header: &NcaHeader,
+    section: usize,
+    f: impl FnOnce(&mut dyn Storage) -> Result<T>,
+) -> Result<T> {
+    match CompressionInfo::parse(header, section) {
+        Some(info) => f(&mut CompressedStorage::new(level, &info)?),
+        None => f(level),
+    }
 }
 
 fn check_section(header: &NcaHeader, i: usize, n: &NcaRef) -> Result<()> {
@@ -376,7 +391,7 @@ impl OpenNca {
         };
         let mut section = NcaSection::new(&mut *self.src, &self.header, self.key, i)?;
         let mut data = SubStorage::new(&mut section, offset, size)?;
-        f(&mut data)
+        decompressed(&mut data, &self.header, i, f)
     }
 }
 
@@ -427,9 +442,10 @@ mod tests {
     use super::*;
     use crate::nca::NcaContentType;
     use crate::testutil::{
-        build_nacp, pattern, ImageBuilder, MetaBuilder, NcaBuilder, NspBuilder, PatchSection, Section, TempDir,
-        TestKeys,
+        build_nacp, build_pfs0, pattern, BuiltNca, Compress, CompressedLevel, ImageBuilder, MetaBuilder, NcaBuilder,
+        NspBuilder, PatchSection, Section, TempDir, TestKeys, CMP_LZ4, CMP_NONE, CMP_ZEROS,
     };
+    use crate::util::u64le;
     use crate::{plan, scan};
 
     #[test]
@@ -831,5 +847,344 @@ mod tests {
         assert_extraction(&out, &files, &dirs);
         assert!(!partial_path(&out).exists());
         assert_eq!(last_bytes, Some((total, total)));
+    }
+
+    // -----------------------------------------------------------------------------------------------------
+    // Compressed sections
+    // -----------------------------------------------------------------------------------------------------
+
+    /// Compressible data: a phrase over and over.
+    fn text(len: usize) -> Vec<u8> {
+        b"All work and no play makes Jack a dull boy. ".iter().copied().cycle().take(len).collect()
+    }
+
+    /// Every directory that `files` and the empty directories `empty` (all '/'-separated paths) imply.
+    fn implied_dirs(files: &BTreeMap<String, Vec<u8>>, empty: &[&str]) -> BTreeSet<String> {
+        fn add_parents(dirs: &mut BTreeSet<String>, path: &str) {
+            for (i, _) in path.match_indices('/') {
+                dirs.insert(path[..i].to_string());
+            }
+        }
+        let mut dirs = BTreeSet::new();
+        for path in files.keys() {
+            add_parents(&mut dirs, path);
+        }
+        for dir in empty {
+            add_parents(&mut dirs, dir);
+            dirs.insert(dir.to_string());
+        }
+        dirs
+    }
+
+    /// Scans the NSPs of one game, groups them and extracts all of it into `out_root/<game name>`. Returns that
+    /// folder and the last byte count the progress reported.
+    fn extract_nsps(keys: &Keys, nsps: &[&Path], out_root: &Path) -> (PathBuf, Option<(u64, u64)>) {
+        let mut titles = Vec::new();
+        for nsp in nsps {
+            titles.extend(scan::scan_file(nsp, keys).expect("scanning an NSP"));
+        }
+        let games = plan::group(titles);
+        assert_eq!(games.len(), 1);
+        let game = &games[0];
+        assert!(game.warnings().is_empty(), "{:?}", game.warnings());
+        let selected: Vec<&Title> = game.titles.iter().collect();
+
+        let out = out_root.join(&game.name);
+        let never = AtomicBool::new(false);
+        let mut last_bytes = None;
+        let mut progress = |p: Progress| {
+            if let Progress::Bytes { done, total } = p {
+                last_bytes = Some((done, total));
+            }
+        };
+        let opts = ExtractOptions::default();
+        let result = extract_game(keys, &selected, &out, &opts, &never, &mut progress).expect("extracting");
+        assert_eq!(result, out);
+        assert!(!partial_path(&out).exists());
+        (out, last_bytes)
+    }
+
+    /// The table offset and size in the compression info of section `section` of `nca`'s FS header, read straight
+    /// from the bytes (0 and 0 if the section isn't compressed).
+    fn compression_info_of(nca: &BuiltNca, keys: &Keys, section: usize) -> (u64, u64) {
+        let header = NcaHeader::decrypt(&nca.bytes, keys).unwrap();
+        let fs = header.fs_header(section);
+        (u64le(fs, 0x178), u64le(fs, 0x180))
+    }
+
+    /// Checks that `section` stores `image` compressed with entries of every type, and returns how.
+    fn check_compressed(section: &Section, image: &[u8]) -> CompressedLevel {
+        let c = section.compression().expect("a compressed section");
+        assert_eq!(c.decompress(), image, "the fixture decompresses to the image");
+        let types: BTreeSet<u8> = c.entries.iter().map(|e| e.compression_type).collect();
+        assert_eq!(types, BTreeSet::from([CMP_NONE, CMP_ZEROS, CMP_LZ4]), "entry types in {:?}", c.entries);
+        assert_ne!(c.level, image);
+        c
+    }
+
+    /// A base game with compressed storage under its executables and its RomFS (but not under its boot logo).
+    /// Compression is built on top of the hash layer's data level: the data is stored as is, as zeros and as LZ4
+    /// blocks, in a RomFS that has a zero-filled file and in a PFS0 that has one too.
+    #[test]
+    fn extract_compressed_base_end_to_end() {
+        const TITLE_ID: u64 = 0x0100_0000_0002_0000;
+        const CONTROL_KEY: Key128 =
+            [0x7C, 0x19, 0xE2, 0xB5, 0x08, 0x4D, 0xA3, 0x66, 0xF0, 0x2B, 0x91, 0xCE, 0x35, 0xD8, 0x7A, 0x14];
+
+        let tmp = TempDir::new("extract-compressed");
+        let keys = TestKeys::keys(&tmp.path().join("keys"));
+
+        // Odd sizes put files at unaligned offsets, and the content is a mix of what compresses and what doesn't.
+        let exefs = [
+            ("main", [pattern(20_000, 1), text(20_000)].concat()),
+            ("main.npdm", pattern(77, 2)),
+            ("rtld", text(9_000)),
+            ("sdk", vec![0; 12_000]),
+            ("subsdk0", pattern(3_001, 3)),
+        ];
+        let logo = [("NintendoLogo.png", pattern(1013, 4))];
+        let romfs = [
+            ("top.txt", b"a file in the root".to_vec()),
+            ("data/random.bin", pattern(150_000, 5)),
+            ("data/zeros.bin", vec![0; 100_000]),
+            ("data/story.txt", text(120_000)),
+            ("data/mixed.bin", [pattern(20_000, 6), vec![0; 20_000], text(20_000)].concat()),
+            ("data/sub/nested.txt", b"nested".to_vec()),
+            ("data/sub/deeper/leaf.bin", pattern(5000, 7)),
+            ("data/empty.dat", Vec::new()),
+        ];
+        let empty_dirs = ["empty", "data/empty_sub"];
+        let control = [
+            ("control.nacp", build_nacp("Compressed Game", "Test Publisher", "1.0.0")),
+            ("icon_AmericanEnglish.dat", pattern(2048, 8)),
+        ];
+
+        let exefs_image = build_pfs0(&as_refs(&exefs));
+        let romfs_data = romfs_image(&romfs, &empty_dirs);
+        use Compress::{Lz4, Stored, Zeros};
+        let exefs_section = Section::Pfs0(exefs_image.clone()).compressed(0x1000, &[Lz4, Zeros, Stored, Zeros, Lz4]);
+        let romfs_section =
+            Section::romfs(romfs_data.clone()).compressed(0x2000, &[Lz4, Stored, Lz4, Zeros, Lz4, Zeros, Stored, Lz4]);
+        let exefs_stored = check_compressed(&exefs_section, &exefs_image);
+        let romfs_stored = check_compressed(&romfs_section, &romfs_data);
+
+        let program = NcaBuilder::new(NcaContentType::Program, TITLE_ID)
+            .section(exefs_section)
+            .section(romfs_section)
+            .section(Section::pfs0(&as_refs(&logo)))
+            .build(&keys);
+        // The FS headers say which sections are compressed.
+        assert_eq!(compression_info_of(&program, &keys, 0), (exefs_stored.table_offset, exefs_stored.table_size));
+        assert_eq!(compression_info_of(&program, &keys, 1), (romfs_stored.table_offset, romfs_stored.table_size));
+        assert_eq!(compression_info_of(&program, &keys, 2), (0, 0));
+
+        let control_nca = NcaBuilder::new(NcaContentType::Control, TITLE_ID)
+            .section_key(CONTROL_KEY)
+            .section(Section::romfs(romfs_image(&control, &[])))
+            .build(&keys);
+        let meta = MetaBuilder::application(TITLE_ID, 0, 0x0001_0000)
+            .content(&program, cnmt::CT_PROGRAM)
+            .content(&control_nca, cnmt::CT_CONTROL)
+            .build(&keys);
+        let nsp = tmp.path().join("in").join("Compressed Game.nsp");
+        NspBuilder::new().nca(&program).nca(&control_nca).nca(&meta).write(&nsp);
+
+        let mut files = BTreeMap::new();
+        for (prefix, group) in
+            [("exefs", &exefs[..]), ("logo", &logo[..]), ("romfs", &romfs[..]), ("control", &control[..])]
+        {
+            for (path, data) in group {
+                files.insert(format!("{prefix}/{path}"), data.clone());
+            }
+        }
+        let romfs_empty_dirs = empty_dirs.map(|d| format!("romfs/{d}"));
+        let dirs = implied_dirs(&files, &romfs_empty_dirs.iter().map(String::as_str).collect::<Vec<_>>());
+        let total: u64 = files.values().map(|d| d.len() as u64).sum();
+
+        let (out, last_bytes) = extract_nsps(&keys, &[&nsp], &tmp.path().join("out"));
+        assert_extraction(&out, &files, &dirs);
+        assert_eq!(last_bytes, Some((total, total)));
+        // The zero-filled files and the compressible ones really came back as what they are, not as stored bytes.
+        assert_eq!(fs::read(out.join("romfs/data/zeros.bin")).unwrap(), vec![0; 100_000]);
+        assert_eq!(fs::read(out.join("exefs/sdk")).unwrap(), vec![0; 12_000]);
+    }
+
+    /// A base game and an update (in separate NSPs) whose patched RomFS is compressed storage, in three ways: the
+    /// update's compression is applied to the patched section whatever the base game's section looks like, and the
+    /// base game's own compression info is never applied to what the update patches.
+    #[test]
+    fn extract_compressed_update_end_to_end() {
+        const APP_ID: u64 = 0x0100_0000_0003_0000;
+        const UPDATE_ID: u64 = APP_ID | 0x800;
+        const UPDATE_VERSION: u32 = 65536;
+        const BASE_CONTROL_KEY: Key128 =
+            [0x15, 0xA8, 0x6E, 0xD3, 0x40, 0xB7, 0x9C, 0x21, 0xFE, 0x03, 0x58, 0xC4, 0x8B, 0x72, 0x1D, 0xE6];
+        const UPDATE_KEY: Key128 =
+            [0xD2, 0x4B, 0x07, 0x9F, 0x61, 0xEA, 0x38, 0xC5, 0x1A, 0x84, 0xF3, 0x5E, 0x90, 0x2D, 0xB6, 0x7F];
+        const UPDATE_CONTROL_KEY: Key128 =
+            [0x68, 0xF1, 0x3A, 0x97, 0xCC, 0x05, 0xDE, 0x42, 0xB9, 0x76, 0x1F, 0xA0, 0x83, 0xE5, 0x2C, 0x5B];
+
+        let tmp = TempDir::new("extract-compressed-update");
+        let keys = TestKeys::keys(&tmp.path().join("keys"));
+
+        // The big files that stay are in both versions of the RomFS; the update must take them from the base game.
+        let stay = pattern(160_000, 1);
+        let zeros = vec![0; 60_000];
+        let base_exefs = [("main", pattern(300, 2)), ("main.npdm", pattern(77, 3))];
+        let logo = [("NintendoLogo.png", pattern(1013, 4))];
+        let base_romfs = [
+            ("top.txt", b"a file in the root".to_vec()),
+            ("data/stay.bin", stay.clone()),
+            ("data/changes.txt", text(70_000)),
+            ("data/zeros.bin", zeros.clone()),
+            ("data/sub/removed.bin", pattern(20_000, 5)),
+            ("data/sub/nested.txt", b"nested".to_vec()),
+        ];
+        let base_empty = ["empty"];
+        let base_control = [
+            ("control.nacp", build_nacp("Updated Game", "Test Publisher", "1.0.0")),
+            ("icon_AmericanEnglish.dat", pattern(2048, 6)),
+        ];
+        // The update changes one file, removes one, adds two (one in a new directory, one with zeros in it) and
+        // shifts everything after the first.
+        let up_exefs = [("main", pattern(412, 7)), ("main.npdm", pattern(95, 8))];
+        let new_romfs = [
+            ("top.txt", b"a file in the root, patched".to_vec()),
+            ("data/stay.bin", stay),
+            ("data/changes.txt", [text(40_000), pattern(20_000, 9), text(9_000)].concat()),
+            ("data/zeros.bin", zeros),
+            ("data/sub/nested.txt", b"nested".to_vec()),
+            ("fresh/inner/new.bin", [vec![0; 30_000], pattern(10_000, 10)].concat()),
+            ("fresh/empty.dat", Vec::new()),
+        ];
+        let new_empty = ["empty", "data/new_empty"];
+        let up_control = [
+            ("control.nacp", build_nacp("Updated Game", "Test Publisher", "1.1.0")),
+            ("icon_AmericanEnglish.dat", pattern(3000, 11)),
+        ];
+        let old_image = romfs_image(&base_romfs, &base_empty);
+        let new_image = romfs_image(&new_romfs, &new_empty);
+
+        // What extraction must produce: the update's executables and control data, the new RomFS, the base's logo.
+        let mut files = BTreeMap::new();
+        for (prefix, group) in
+            [("exefs", &up_exefs[..]), ("logo", &logo[..]), ("romfs", &new_romfs[..]), ("control", &up_control[..])]
+        {
+            for (path, data) in group {
+                files.insert(format!("{prefix}/{path}"), data.clone());
+            }
+        }
+        let new_empty_dirs = new_empty.map(|d| format!("romfs/{d}"));
+        let dirs = implied_dirs(&files, &new_empty_dirs.iter().map(String::as_str).collect::<Vec<_>>());
+        let total: u64 = files.values().map(|d| d.len() as u64).sum();
+
+        use Compress::{Lz4, Stored, Zeros};
+        type Compression<'a> = Option<(usize, &'a [Compress])>;
+        let update_kinds = [Lz4, Stored, Lz4, Zeros, Lz4, Zeros, Stored, Lz4];
+        let base_kinds = [Stored, Lz4, Zeros, Lz4];
+        let variants: [(&str, Compression, Compression); 3] = [
+            ("update compressed, base plain", None, Some((0x2000, &update_kinds))),
+            ("update and base compressed, differently", Some((0x1000, &base_kinds)), Some((0x2000, &update_kinds))),
+            ("base compressed, update plain", Some((0x1000, &base_kinds)), None),
+        ];
+        for (n, (label, base_how, update_how)) in variants.into_iter().enumerate() {
+            let dir = tmp.path().join(format!("variant{n}"));
+            let compress = |section: Section, how: Compression| match how {
+                Some((block_size, kinds)) => section.compressed(block_size, kinds),
+                None => section,
+            };
+
+            // The base game. The patch is made against the base's RomFS section exactly as its NCA stores it.
+            let base_section = compress(Section::romfs(old_image.clone()), base_how);
+            let base_plain = base_section.plaintext();
+            let base_program = NcaBuilder::new(NcaContentType::Program, APP_ID)
+                .section(Section::pfs0(&as_refs(&base_exefs)))
+                .section(base_section.clone())
+                .section(Section::pfs0(&as_refs(&logo)))
+                .build(&keys);
+            let base_info = compression_info_of(&base_program, &keys, 1);
+            match base_how {
+                None => assert_eq!(base_info, (0, 0), "{label}: the base game's RomFS section is not compressed"),
+                Some(_) => {
+                    let c = check_compressed(&base_section, &old_image);
+                    assert_eq!(base_info, (c.table_offset, c.table_size), "{label}");
+                }
+            }
+            let base_control_nca = NcaBuilder::new(NcaContentType::Control, APP_ID)
+                .section_key(BASE_CONTROL_KEY)
+                .section(Section::romfs(romfs_image(&base_control, &[])))
+                .build(&keys);
+            let base_meta = MetaBuilder::application(APP_ID, 0, 0x0001_0000)
+                .content(&base_program, cnmt::CT_PROGRAM)
+                .content(&base_control_nca, cnmt::CT_CONTROL)
+                .build(&keys);
+            let base_nsp = dir.join("in").join("Updated Game.nsp");
+            NspBuilder::new().nca(&base_program).nca(&base_control_nca).nca(&base_meta).write(&base_nsp);
+
+            // The update. Chunks of 0x10 find the base game's data wherever the compressed storage put it.
+            let mut patch = PatchSection::new(&base_plain, &new_image).chunk_size(0x10);
+            let mut update_stored = None;
+            if let Some((block_size, kinds)) = update_how {
+                patch = patch.compressed(block_size, kinds);
+                let section = Section::romfs(new_image.clone()).compressed(block_size, kinds);
+                update_stored = Some(check_compressed(&section, &new_image));
+            }
+            let layout = patch.layout();
+            let used = |storage| layout.entries.iter().filter(|e| e.storage_index == storage).count();
+            assert!(used(0) > 1 && used(1) > 1, "{label}: {} from the base game, {} from the update", used(0), used(1));
+            let up_program = NcaBuilder::new(NcaContentType::Program, UPDATE_ID)
+                .section_key(UPDATE_KEY)
+                .section(Section::pfs0(&as_refs(&up_exefs)))
+                .section(Section::patch(patch))
+                .build(&keys);
+            let up_info = compression_info_of(&up_program, &keys, 1);
+            match &update_stored {
+                None => assert_eq!(up_info, (0, 0), "{label}: the update's RomFS section is not compressed"),
+                Some(c) => assert_eq!(up_info, (c.table_offset, c.table_size), "{label}"),
+            }
+            assert_ne!(up_info, base_info, "{label}");
+
+            // The update's data level, where its IVFC header puts it, holds the compressed data and table (or the
+            // image) and much of that comes from the base game, not from the update.
+            let up_header = NcaHeader::decrypt(&up_program.bytes, &keys).unwrap();
+            let (data_offset, data_size) = nca::ivfc_data_level(&up_header, 1).unwrap();
+            let (level, data_end) = match &update_stored {
+                Some(c) => (c.level.clone(), c.table_offset),
+                None => (new_image.clone(), new_image.len() as u64),
+            };
+            assert_eq!(data_size, level.len() as u64, "{label}");
+            let from_base: usize = layout
+                .entries
+                .iter()
+                .filter(|e| e.storage_index == 0)
+                .map(|e| {
+                    // The part of the entry inside the stored data, as offsets into it.
+                    let lo = e.virtual_offset.max(data_offset);
+                    let hi = (e.virtual_offset + e.len).min(data_offset + data_end);
+                    let part =
+                        if lo < hi { &level[(lo - data_offset) as usize..(hi - data_offset) as usize] } else { &[] };
+                    part.chunks(0x10).filter(|c| c.iter().any(|&b| b != 0)).count() * 0x10
+                })
+                .sum();
+            assert!(
+                from_base > 0x4000,
+                "{label}: only {from_base:#x} bytes of the stored data come from the base game"
+            );
+
+            let up_control_nca = NcaBuilder::new(NcaContentType::Control, UPDATE_ID)
+                .section_key(UPDATE_CONTROL_KEY)
+                .section(Section::romfs(romfs_image(&up_control, &[])))
+                .build(&keys);
+            let up_meta = MetaBuilder::patch(APP_ID, UPDATE_VERSION, 0x0002_0000)
+                .content(&up_program, cnmt::CT_PROGRAM)
+                .content(&up_control_nca, cnmt::CT_CONTROL)
+                .build(&keys);
+            let update_nsp = dir.join("in").join("Updated Game [Update].nsp");
+            NspBuilder::new().nca(&up_program).nca(&up_control_nca).nca(&up_meta).write(&update_nsp);
+
+            let (out, last_bytes) = extract_nsps(&keys, &[&base_nsp, &update_nsp], &dir.join("out"));
+            assert_extraction(&out, &files, &dirs);
+            assert_eq!(last_bytes, Some((total, total)), "{label}");
+        }
     }
 }

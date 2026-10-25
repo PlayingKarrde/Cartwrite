@@ -74,7 +74,7 @@ fn l2_node_count(sets: usize) -> usize {
 }
 
 /// An entry type stored in a bucket tree.
-trait BucketEntry: Sized {
+pub(crate) trait BucketEntry: Sized {
     const SIZE: usize;
     fn parse(b: &[u8]) -> Self;
     /// The (virtual) offset where this entry's range starts.
@@ -83,15 +83,15 @@ trait BucketEntry: Sized {
 
 /// A bucket tree's entries in offset order. Entry `i` covers `[offset(i), offset(i + 1))`,
 /// and the last one runs to `end`.
-struct BucketTree<E> {
-    entries: Vec<E>,
-    end: u64,
+pub(crate) struct BucketTree<E> {
+    pub(crate) entries: Vec<E>,
+    pub(crate) end: u64,
 }
 
 impl<E: BucketEntry> BucketTree<E> {
     /// Reads a tree whose nodes start at offset 0 of `meta`, described by the 0x10-byte
     /// bucket tree `header` from the FS header.
-    fn read(meta: &mut dyn Storage, header: &[u8; 0x10], what: &str) -> Result<Self> {
+    pub(crate) fn read(meta: &mut dyn Storage, header: &[u8; 0x10], what: &str) -> Result<Self> {
         if &header[..4] != b"BKTR" {
             return fmt_err(format!("{what} table has no BKTR header"));
         }
@@ -143,21 +143,21 @@ impl<E: BucketEntry> BucketTree<E> {
         Ok(Self { entries, end })
     }
 
-    fn start(&self) -> u64 {
+    pub(crate) fn start(&self) -> u64 {
         self.entries[0].offset()
     }
 
     /// Index of the entry covering `offset`, which must be in `[start, end)`.
-    fn find(&self, offset: u64) -> usize {
+    pub(crate) fn find(&self, offset: u64) -> usize {
         self.entries.partition_point(|e| e.offset() <= offset) - 1
     }
 
     /// End of entry `i`'s range.
-    fn entry_end(&self, i: usize) -> u64 {
+    pub(crate) fn entry_end(&self, i: usize) -> u64 {
         self.entries.get(i + 1).map_or(self.end, |e| e.offset())
     }
 
-    fn check_range(&self, offset: u64, len: usize, what: &str) -> Result<()> {
+    pub(crate) fn check_range(&self, offset: u64, len: usize, what: &str) -> Result<()> {
         match offset.checked_add(len as u64) {
             Some(end) if offset >= self.start() && end <= self.end => Ok(()),
             _ => fmt_err(format!("read outside the {what} table's range")),

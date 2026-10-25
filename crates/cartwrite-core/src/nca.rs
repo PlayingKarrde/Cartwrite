@@ -139,18 +139,11 @@ impl NcaHeader {
     }
 
     /// Storage layers under section `i` that reading it doesn't support yet: sparse storage
-    /// (data that ships in a later update) and LZ4-compressed storage, both from newer NCAs.
-    /// Mirrors LibHac's `ExistsSparseLayer` / `ExistsCompressionLayer`.
+    /// (data that ships in a later update, in newer NCAs). Mirrors Atmosphère's
+    /// `ExistsSparseLayer`. Compressed storage is handled by [`crate::compressed`].
     pub fn unsupported_layer(&self, i: usize) -> Option<&'static str> {
-        let fs = self.fs_header(i);
-        // SparseInfo is at 0x148 (generation at +0x28), CompressionInfo at 0x178.
-        if u16le(fs, 0x170) != 0 {
-            Some("sparse storage")
-        } else if u64le(fs, 0x178) != 0 && u64le(fs, 0x180) != 0 {
-            Some("compressed storage")
-        } else {
-            None
-        }
+        // SparseInfo is at 0x148, with its generation at +0x28.
+        (u16le(self.fs_header(i), 0x170) != 0).then_some("sparse storage")
     }
 
     /// Upper 8 bytes of the AES-CTR counter for section `i`.
