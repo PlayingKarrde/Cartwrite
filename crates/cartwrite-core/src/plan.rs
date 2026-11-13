@@ -65,6 +65,18 @@ pub fn output_stem(name: &str, application_id: u64, titles: &[&Title]) -> String
     sanitize(&format!("{name} [{application_id:016X}][{version}]{tag}"))
 }
 
+/// File name (without extension) for one title written on its own, e.g. `Name [TitleID][v1.0.1]`.
+/// DLC and DLC updates are told apart from the base game by their own title ID.
+pub fn title_stem(name: &str, title: &Title) -> String {
+    let tag = match title.kind {
+        TitleKind::Base => "",
+        TitleKind::Update => " (Update)",
+        TitleKind::Dlc => " (DLC)",
+        TitleKind::DlcUpdate => " (DLC update)",
+    };
+    sanitize(&format!("{name}{tag} [{:016X}][{}]", title.title_id, title.version_label()))
+}
+
 pub fn sanitize(s: &str) -> String {
     let cleaned: String = s
         .chars()

@@ -87,61 +87,10 @@ pub fn build_xci(
     if titles.is_empty() {
         return fmt_err("nothing selected to build");
     }
-    let mut files: HashMap<PathBuf, File> = HashMap::new();
-    let mut open = |p: &PathBuf| -> Result<File> {
-        if let Some(f) = files.get(p) {
-            return Ok(f.try_clone()?);
-        }
-        let f = File::open(p).map_err(|e| Error::File { path: p.clone(), source: e })?;
-        files.insert(p.clone(), f.try_clone()?);
-        Ok(f)
-    };
+    let mut sources = Sources::default();
 
     // 1. Prepare every NCA header.
-    let mut items: Vec<Item> = Vec::new();
-    let mut seen = HashSet::new();
-    for title in titles {
-        let rsv_target = match (opts.patch_rsv, title.required_system_version) {
-            (true, Some(rsv)) => crate::rsv::patched_rsv(rsv, title.key_generation()),
-            _ => None,
-        };
-        for n in title.ncas(opts.include_deltas) {
-            if !seen.insert(n.out_name.clone()) {
-                continue;
-            }
-            check_cancel(cancel)?;
-            let mut f = open(&n.source)?;
-            let enc = read_vec_at(&mut f, n.offset, HEADER_SIZE)?;
-            let mut header = NcaHeader::decrypt(&enc, keys)?;
-            if let Some(tk) = title.title_key(keys, &header)? {
-                header.remove_title_rights(keys, &tk)?;
-            }
-            let is_meta = n.content_type == crate::cnmt::CT_META;
-            let payload = match rsv_target.filter(|_| is_meta) {
-                Some(new_rsv) => {
-                    progress(Progress::Log(format!(
-                        "{:016X}: RequiredSystemVersion {} -> {}",
-                        title.title_id,
-                        crate::rsv::format_rsv(title.required_system_version.unwrap_or(0)),
-                        crate::rsv::format_rsv(new_rsv)
-                    )));
-                    Payload::Memory(patch_meta_rsv(keys, &mut f, n, header, new_rsv)?)
-                }
-                None => Payload::Stream { header: header.encrypt(keys) },
-            };
-            let first = match &payload {
-                Payload::Memory(v) => &v[..0x200],
-                Payload::Stream { header } => &header[..0x200],
-            };
-            items.push(Item {
-                nca: n,
-                name: n.out_name.clone(),
-                size: n.nca_size,
-                hash: Sha256::digest(first).into(),
-                payload,
-            });
-        }
-    }
+    let items = prepare_items(keys, titles, opts, cancel, progress, &mut sources)?;
 
     // 2. Headers.
     let sec = hfs0_header(&items.iter().map(|i| (i.name.as_str(), i.size, i.hash, 0x200)).collect::<Vec<_>>());
@@ -179,46 +128,8 @@ pub fn build_xci(
         emit(&mut out, &norm, &mut done)?;
         emit(&mut out, &sec, &mut done)?;
 
-        let mut buf = vec![0u8; COPY_BUF];
         for item in &items {
-            check_cancel(cancel)?;
-            let n = item.nca;
-            match &item.payload {
-                Payload::Memory(data) => emit(&mut out, data, &mut done)?,
-                Payload::Stream { header } => {
-                    let mut f = open(&n.source)?;
-                    emit(&mut out, header, &mut done)?;
-                    if n.is_ncz {
-                        // The rest of the uncompressed 0x4000-byte head (less for tiny NCAs).
-                        let head_end = UNCOMPRESSED_HEADER.min(n.nca_size);
-                        let raw = read_vec_at(
-                            &mut f,
-                            n.offset + HEADER_SIZE as u64,
-                            (head_end - HEADER_SIZE as u64) as usize,
-                        )?;
-                        emit(&mut out, &raw, &mut done)?;
-                        let info = NczInfo::parse(&mut f, n.offset, n.stored_size)?;
-                        let mut pos = UNCOMPRESSED_HEADER;
-                        info.decompress(&f, n.nca_size, &mut |chunk| {
-                            check_cancel(cancel)?;
-                            let take = chunk.len().min(n.nca_size.saturating_sub(pos) as usize);
-                            let mut c = chunk[..take].to_vec();
-                            info.reencrypt(pos, &mut c);
-                            pos += take as u64;
-                            emit(&mut out, &c, &mut done)
-                        })?;
-                    } else {
-                        let mut off = HEADER_SIZE as u64;
-                        while off < n.stored_size {
-                            check_cancel(cancel)?;
-                            let len = ((n.stored_size - off) as usize).min(buf.len());
-                            read_at(&mut f, n.offset + off, &mut buf[..len])?;
-                            emit(&mut out, &buf[..len], &mut done)?;
-                            off += len as u64;
-                        }
-                    }
-                }
-            }
+            write_item(item, &mut sources, cancel, &mut |data| emit(&mut out, data, &mut done))?;
         }
         if done != total {
             return fmt_err(format!("internal size mismatch: wrote {done} of {total} bytes"));
@@ -227,8 +138,7 @@ pub fn build_xci(
     })();
 
     // Close sources first so the output may replace one of them (Windows locks open files).
-    drop(open);
-    drop(files);
+    drop(sources);
     match result {
         Ok(()) => out.finish(),
         Err(e) => {
@@ -236,6 +146,197 @@ pub fn build_xci(
             Err(e)
         }
     }
+}
+
+/// Source files opened on demand and kept open for the length of a build.
+#[derive(Default)]
+struct Sources {
+    files: HashMap<PathBuf, File>,
+}
+
+impl Sources {
+    fn open(&mut self, p: &PathBuf) -> Result<File> {
+        if let Some(f) = self.files.get(p) {
+            return Ok(f.try_clone()?);
+        }
+        let f = File::open(p).map_err(|e| Error::File { path: p.clone(), source: e })?;
+        self.files.insert(p.clone(), f.try_clone()?);
+        Ok(f)
+    }
+}
+
+/// Prepares the NCA headers (rights removed, RSV patched) of every NCA of `titles`, once per name.
+fn prepare_items<'a>(
+    keys: &Keys,
+    titles: &[&'a Title],
+    opts: &BuildOptions,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(Progress),
+    sources: &mut Sources,
+) -> Result<Vec<Item<'a>>> {
+    let mut items: Vec<Item> = Vec::new();
+    let mut seen = HashSet::new();
+    for title in titles {
+        let rsv_target = match (opts.patch_rsv, title.required_system_version) {
+            (true, Some(rsv)) => crate::rsv::patched_rsv(rsv, title.key_generation()),
+            _ => None,
+        };
+        for n in title.ncas(opts.include_deltas) {
+            if !seen.insert(n.out_name.clone()) {
+                continue;
+            }
+            check_cancel(cancel)?;
+            let mut f = sources.open(&n.source)?;
+            let enc = read_vec_at(&mut f, n.offset, HEADER_SIZE)?;
+            let mut header = NcaHeader::decrypt(&enc, keys)?;
+            if let Some(tk) = title.title_key(keys, &header)? {
+                header.remove_title_rights(keys, &tk)?;
+            }
+            let is_meta = n.content_type == crate::cnmt::CT_META;
+            let payload = match rsv_target.filter(|_| is_meta) {
+                Some(new_rsv) => {
+                    progress(Progress::Log(format!(
+                        "{:016X}: RequiredSystemVersion {} -> {}",
+                        title.title_id,
+                        crate::rsv::format_rsv(title.required_system_version.unwrap_or(0)),
+                        crate::rsv::format_rsv(new_rsv)
+                    )));
+                    Payload::Memory(patch_meta_rsv(keys, &mut f, n, header, new_rsv)?)
+                }
+                None => Payload::Stream { header: header.encrypt(keys) },
+            };
+            let first = match &payload {
+                Payload::Memory(v) => &v[..0x200],
+                Payload::Stream { header } => &header[..0x200],
+            };
+            items.push(Item {
+                nca: n,
+                name: n.out_name.clone(),
+                size: n.nca_size,
+                hash: Sha256::digest(first).into(),
+                payload,
+            });
+        }
+    }
+
+    Ok(items)
+}
+
+/// Writes one prepared NCA through `emit`.
+fn write_item(
+    item: &Item,
+    sources: &mut Sources,
+    cancel: &AtomicBool,
+    emit: &mut dyn FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
+    let n = item.nca;
+    match &item.payload {
+        Payload::Memory(data) => emit(data)?,
+        Payload::Stream { header } => {
+            let mut f = sources.open(&n.source)?;
+            emit(header)?;
+            if n.is_ncz {
+                // The rest of the uncompressed 0x4000-byte head (less for tiny NCAs).
+                let head_end = UNCOMPRESSED_HEADER.min(n.nca_size);
+                let raw = read_vec_at(&mut f, n.offset + HEADER_SIZE as u64, (head_end - HEADER_SIZE as u64) as usize)?;
+                emit(&raw)?;
+                let info = NczInfo::parse(&mut f, n.offset, n.stored_size)?;
+                let mut pos = UNCOMPRESSED_HEADER;
+                info.decompress(&f, n.nca_size, &mut |chunk| {
+                    check_cancel(cancel)?;
+                    let take = chunk.len().min(n.nca_size.saturating_sub(pos) as usize);
+                    let mut c = chunk[..take].to_vec();
+                    info.reencrypt(pos, &mut c);
+                    pos += take as u64;
+                    emit(&c)
+                })?;
+            } else {
+                let mut buf = vec![0u8; COPY_BUF];
+                let mut off = HEADER_SIZE as u64;
+                while off < n.stored_size {
+                    check_cancel(cancel)?;
+                    let len = ((n.stored_size - off) as usize).min(buf.len());
+                    read_at(&mut f, n.offset + off, &mut buf[..len])?;
+                    emit(&buf[..len])?;
+                    off += len as u64;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Builds a standard-crypto NSP holding just `title` (title rights removed, so no ticket or
+/// certificate is needed). Returns the file written.
+pub fn build_nsp(
+    keys: &Keys,
+    title: &Title,
+    output: &Path,
+    opts: &BuildOptions,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(Progress),
+) -> Result<Vec<PathBuf>> {
+    let mut sources = Sources::default();
+    let items = prepare_items(keys, &[title], opts, cancel, progress, &mut sources)?;
+    let header = pfs0_header(&items.iter().map(|i| (i.name.as_str(), i.size)).collect::<Vec<_>>());
+    let total = header.len() as u64 + items.iter().map(|i| i.size).sum::<u64>();
+
+    progress(Progress::Log(format!("Writing {} ({} NCAs)", output.display(), items.len())));
+    let mut out = SplitWriter::create(output, None)?;
+    let result = (|| -> Result<()> {
+        let mut done = 0u64;
+        let mut emit = |data: &[u8]| -> Result<()> {
+            out.write_all(data)?;
+            done += data.len() as u64;
+            progress(Progress::Bytes { done, total });
+            Ok(())
+        };
+        emit(&header)?;
+        for item in &items {
+            write_item(item, &mut sources, cancel, &mut emit)?;
+        }
+        if done != total {
+            return fmt_err(format!("internal size mismatch: wrote {done} of {total} bytes"));
+        }
+        Ok(())
+    })();
+    drop(sources);
+    match result {
+        Ok(()) => out.finish(),
+        Err(e) => {
+            out.abort();
+            Err(e)
+        }
+    }
+}
+
+/// PFS0 header for (name, size) entries, padded to a multiple of 0x20 bytes.
+fn pfs0_header(entries: &[(&str, u64)]) -> Vec<u8> {
+    let mut strings = Vec::new();
+    let mut name_offsets = Vec::new();
+    for (name, _) in entries {
+        name_offsets.push(strings.len() as u32);
+        strings.extend_from_slice(name.as_bytes());
+        strings.push(0);
+    }
+    let unpadded = 0x10 + entries.len() * 0x18 + strings.len();
+    strings.resize(strings.len() + (unpadded.div_ceil(0x20) * 0x20 - unpadded), 0);
+
+    let mut h = Vec::with_capacity(0x10 + entries.len() * 0x18 + strings.len());
+    h.extend_from_slice(b"PFS0");
+    h.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    h.extend_from_slice(&(strings.len() as u32).to_le_bytes());
+    h.extend_from_slice(&[0; 4]);
+    let mut offset = 0u64;
+    for (i, (_, size)) in entries.iter().enumerate() {
+        h.extend_from_slice(&offset.to_le_bytes());
+        h.extend_from_slice(&size.to_le_bytes());
+        h.extend_from_slice(&name_offsets[i].to_le_bytes());
+        h.extend_from_slice(&[0; 4]);
+        offset += size;
+    }
+    h.extend_from_slice(&strings);
+    h
 }
 
 fn check_cancel(cancel: &AtomicBool) -> Result<()> {
@@ -540,5 +641,64 @@ mod tests {
     fn gameinfo_blobs_are_0x70() {
         assert_eq!(parse_hex_const(GAMEINFO_LARGE).len(), 0x70);
         assert_eq!(parse_hex_const(GAMEINFO_SMALL).len(), 0x70);
+    }
+
+    #[test]
+    fn nsp_holds_one_title_and_scans_back() {
+        use crate::cnmt;
+        use crate::nca::NcaContentType;
+        use crate::scan::{scan_file, TitleKind};
+        use crate::testutil::{pattern, ImageBuilder, MetaBuilder, NcaBuilder, NspBuilder, Section, TempDir, TestKeys};
+
+        const APP: u64 = 0x0100_0000_0001_0000;
+        const DLC: u64 = APP + 0x1001;
+        let tmp = TempDir::new("build-nsp");
+        let keys = TestKeys::keys(tmp.path());
+        let data = |id: u64, seed: u64| {
+            let mut image = ImageBuilder::new();
+            image.file("data.bin", &pattern(3000, seed));
+            NcaBuilder::new(NcaContentType::Data, id).section(Section::romfs(image.build())).build(&keys)
+        };
+        let prog = NcaBuilder::new(NcaContentType::Program, APP)
+            .section(Section::pfs0(&[("main", &pattern(2000, 1))]))
+            .build(&keys);
+        let base_data = data(APP, 2);
+        let base_meta = MetaBuilder::application(APP, 0, 0x0001_0000)
+            .content(&prog, cnmt::CT_PROGRAM)
+            .content(&base_data, cnmt::CT_DATA)
+            .build(&keys);
+        let dlc_data = data(DLC, 3);
+        let dlc_meta = MetaBuilder::add_on_content(DLC, APP, 0).content(&dlc_data, cnmt::CT_DATA).build(&keys);
+        let src = tmp.path().join("everything.nsp");
+        NspBuilder::new().nca(&prog).nca(&base_data).nca(&base_meta).nca(&dlc_data).nca(&dlc_meta).write(&src);
+
+        let titles = scan_file(&src, &keys).unwrap();
+        assert_eq!(titles.len(), 2);
+        let cancel = AtomicBool::new(false);
+        for t in &titles {
+            let out = tmp.path().join(format!("{:016X}.nsp", t.title_id));
+            let written = build_nsp(&keys, t, &out, &BuildOptions::default(), &cancel, &mut |_| {}).unwrap();
+            assert_eq!(written, [out.clone()]);
+            let back = scan_file(&out, &keys).unwrap();
+            assert_eq!(back.len(), 1);
+            let b = &back[0];
+            assert_eq!((b.title_id, b.kind, b.version), (t.title_id, t.kind, t.version));
+            assert_eq!(b.contents.len(), t.contents.len());
+            assert_eq!(b.size(false), t.size(false));
+            assert!(b.warnings.is_empty(), "{:?}", b.warnings);
+            assert!(b.tickets.is_empty());
+        }
+        assert!(titles.iter().any(|t| t.kind == TitleKind::Dlc));
+    }
+
+    #[test]
+    fn pfs0_header_layout() {
+        use crate::util::{u32le, u64le};
+        let h = pfs0_header(&[("a.nca", 0x10), ("b.cnmt.nca", 0x20)]);
+        assert_eq!(&h[..4], b"PFS0");
+        assert_eq!(h.len() % 0x20, 0);
+        assert_eq!(u32le(&h, 4), 2);
+        assert_eq!(u64le(&h, 0x10 + 0x18), 0x10); // second file follows the first
+        assert_eq!(u64le(&h, 0x10 + 0x18 + 8), 0x20);
     }
 }

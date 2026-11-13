@@ -122,6 +122,17 @@ Tools that read an extracted game usually want `<name>`, the folder that holds `
 - If the folders already exist, the button reads **Replace**. Cartwrite only replaces folders
   that are an earlier extraction.
 
+### Save as separate NSPs
+
+Click **NSPs…** on a game card, pick a folder and click **Save**. The base game, the update and
+each DLC are written to an NSP of their own, named like `Name (DLC) [titleid][v1.0].nsp`. This
+works from any input, including an XCI that holds a game with its update and DLC.
+
+- The NSPs have their title rights removed, so they need no ticket or certificate and install on
+  a console running custom firmware.
+- Untick a row under **Contents** to leave that title out.
+- Command line: `cartwrite-cli nsp [-o DIR] <files...>`.
+
 ### Check for newer updates and missing DLC
 
 This is off by default. Turn on **Check for newer updates and missing DLC** in Settings and

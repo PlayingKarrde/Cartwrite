@@ -19,8 +19,8 @@ use eframe::egui::{self, Color32, RichText};
 
 use crate::theme::{self, ThemeChoice, ThemeStyle};
 use crate::worker::{
-    spawn_build, spawn_extract, spawn_regions, spawn_scan, spawn_titledb, BuildJob, BuildMsg, ExtractJob, RegionMsg,
-    ScanMsg, TitleDbResult,
+    spawn_build, spawn_extract, spawn_nsps, spawn_regions, spawn_scan, spawn_titledb, BuildJob, BuildMsg, ExtractJob,
+    NspJob, RegionMsg, ScanMsg, TitleDbResult,
 };
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -48,6 +48,8 @@ struct Settings {
     extract_dir: Option<PathBuf>,
     /// Last "Game only" / "Game + DLC" choice for extracting.
     extract_dlc: bool,
+    /// Last folder separate NSPs were written to.
+    nsp_dir: Option<PathBuf>,
 }
 
 impl Default for Settings {
@@ -68,6 +70,7 @@ impl Default for Settings {
             regions_source: regions::DEFAULT_SOURCE.into(),
             extract_dir: None,
             extract_dlc: false,
+            nsp_dir: None,
         }
     }
 }
@@ -77,6 +80,7 @@ impl Default for Settings {
 enum JobKind {
     Build,
     Extract,
+    Nsp,
 }
 
 impl JobKind {
@@ -84,6 +88,7 @@ impl JobKind {
         match self {
             Self::Build => "Building",
             Self::Extract => "Extracting",
+            Self::Nsp => "Writing NSPs",
         }
     }
 
@@ -91,6 +96,7 @@ impl JobKind {
         match self {
             Self::Build => "Built",
             Self::Extract => "Extracted",
+            Self::Nsp => "Saved NSPs",
         }
     }
 }
@@ -158,6 +164,13 @@ struct Job {
     bytes_started: Option<Instant>,
 }
 
+/// The "Save as NSPs" dialog.
+struct NspDialog {
+    application_id: u64,
+    /// Folder the NSPs are written to.
+    dir: PathBuf,
+}
+
 /// The "Extract to folder" dialog.
 struct ExtractDialog {
     application_id: u64,
@@ -179,6 +192,7 @@ pub struct App {
     log: Vec<(Instant, String, bool)>,
     show_settings: bool,
     extract_dialog: Option<ExtractDialog>,
+    nsp_dialog: Option<NspDialog>,
     show_log: bool,
     pending_rescan: bool,
     scanned: HashSet<PathBuf>,
@@ -266,6 +280,7 @@ impl App {
             log: Vec::new(),
             show_settings: false,
             extract_dialog: None,
+            nsp_dialog: None,
             show_log: false,
             pending_rescan: false,
             scanned: HashSet::new(),
@@ -707,6 +722,43 @@ impl App {
         });
     }
 
+    /// Opens the "Save as NSPs" dialog for a game.
+    fn open_nsp_dialog(&mut self, id: u64) {
+        let Some(g) = self.games.iter().find(|g| g.game.application_id == id) else { return };
+        let dir = self.settings.nsp_dir.clone().unwrap_or_else(|| self.output_dir_for(g));
+        self.nsp_dialog = Some(NspDialog { application_id: id, dir });
+    }
+
+    /// Writes each selected title of a game to its own NSP in `dir`.
+    fn start_nsps(&mut self, ctx: &egui::Context, id: u64, dir: PathBuf) {
+        let Some(keys) = self.keys.clone() else { return };
+        let opts = BuildOptions {
+            patch_rsv: self.settings.patch_rsv,
+            include_deltas: self.settings.include_deltas,
+            split_fat32: false,
+        };
+        let Some(g) = self.games.iter_mut().find(|g| g.game.application_id == id) else { return };
+        let titles: Vec<Title> = g.chosen().into_iter().cloned().collect();
+        if titles.is_empty() {
+            return;
+        }
+        let bytes_total = titles.iter().map(|t| t.size(opts.include_deltas)).sum();
+        g.status = Status::Queued;
+        let job = NspJob { application_id: id, name: g.game.name.clone(), titles, dir };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let rx = spawn_nsps(ctx.clone(), keys, job, opts, cancel.clone());
+        self.job = Some(Job {
+            kind: JobKind::Nsp,
+            rx,
+            cancel,
+            started: Instant::now(),
+            current: None,
+            bytes_before: 0,
+            bytes_total,
+            bytes_started: None,
+        });
+    }
+
     /// Source XCIs that are safe to delete after rebuilding `g`: every title they hold must
     /// end up in the new XCI (or be an older version of one that does), they must not hold
     /// other games, and nothing in them may have been skipped while reading.
@@ -1063,6 +1115,7 @@ impl App {
         let region_db = self.active_regions();
         let mut build_one = None;
         let mut extract_one = None;
+        let mut nsp_one = None;
         let mut remove = None;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             for (i, g) in self.games.iter_mut().enumerate() {
@@ -1076,6 +1129,7 @@ impl App {
                     CardAction::None => {}
                     CardAction::Build => build_one = Some(g.game.application_id),
                     CardAction::Extract => extract_one = Some(g.game.application_id),
+                    CardAction::Nsp => nsp_one = Some(g.game.application_id),
                     CardAction::Remove => remove = Some(i),
                 }
                 ui.add_space(10.0);
@@ -1090,6 +1144,9 @@ impl App {
         }
         if let Some(id) = extract_one {
             self.open_extract_dialog(id);
+        }
+        if let Some(id) = nsp_one {
+            self.open_nsp_dialog(id);
         }
         if let Some(i) = remove {
             let g = self.games.remove(i);
@@ -1376,6 +1433,76 @@ impl App {
         }
     }
 
+    fn nsp_modal(&mut self, ctx: &egui::Context) {
+        let Some(mut dlg) = self.nsp_dialog.take() else { return };
+        let Some(g) = self.games.iter().find(|g| g.game.application_id == dlg.application_id) else { return };
+        let p = theme::palette_for(theme::style(), ctx.theme() == egui::Theme::Dark);
+        let can_start = self.keys.is_some() && !self.busy();
+        let names: Vec<String> =
+            g.chosen().iter().map(|t| format!("{}.nsp", cartwrite_core::plan::title_stem(&g.game.name, t))).collect();
+        let mut close = false;
+        let mut start = false;
+        let modal = egui::Modal::new(egui::Id::new("nsp")).frame(modal_frame(&p)).show(ctx, |ui| {
+            ui.set_width(460.0);
+            ui.set_max_width(460.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Save as separate NSPs").font(theme::semibold(20.0)));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::icon_button(ui, true, "✕", "Close").clicked() {
+                        close = true;
+                    }
+                });
+            });
+            ui.add_space(8.0);
+            ui.label(RichText::new(&g.game.name).font(theme::semibold(15.0)));
+            ui.label(
+                RichText::new(
+                    "Writes the base game, update and each DLC to a file of its own. The files need no tickets.",
+                )
+                .size(12.0)
+                .color(p.text_dim),
+            );
+
+            section(ui, "DESTINATION");
+            let label = format!("{}  ⏷", short_path(&dlg.dir, 40));
+            if theme::secondary_button(ui, true, label).on_hover_text(dlg.dir.display().to_string()).clicked() {
+                if let Some(d) = rfd::FileDialog::new().set_directory(&dlg.dir).pick_folder() {
+                    dlg.dir = d;
+                }
+            }
+
+            section(ui, "FILES");
+            egui::ScrollArea::vertical().max_height(220.0).auto_shrink([false, true]).show(ui, |ui| {
+                for n in &names {
+                    ui.add(egui::Label::new(RichText::new(n).size(12.5).color(p.text_dim)).truncate())
+                        .on_hover_text(dlg.dir.join(n).display().to_string());
+                }
+            });
+            let exists = names.iter().any(|n| dlg.dir.join(n).exists());
+            if exists {
+                ui.add_space(8.0);
+                ui.label(RichText::new("Files with these names already exist and will be replaced.").color(p.warn));
+            }
+
+            ui.add_space(14.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let text = if exists { "   Replace   " } else { "   Save   " };
+                if theme::primary_button(ui, can_start && !names.is_empty(), text).clicked() {
+                    start = true;
+                }
+                if theme::ghost_button(ui, true, "Cancel").clicked() {
+                    close = true;
+                }
+            });
+        });
+        if start {
+            self.settings.nsp_dir = Some(dlg.dir.clone());
+            self.start_nsps(ctx, dlg.application_id, dlg.dir);
+        } else if !(close || modal.should_close()) {
+            self.nsp_dialog = Some(dlg);
+        }
+    }
+
     fn extract_modal(&mut self, ctx: &egui::Context) {
         let Some(mut dlg) = self.extract_dialog.take() else { return };
         // The game was removed or regrouped away while the dialog was open: close it.
@@ -1558,6 +1685,7 @@ enum CardAction {
     None,
     Build,
     Extract,
+    Nsp,
     Remove,
 }
 
@@ -1573,6 +1701,12 @@ fn kind_color(p: &theme::Palette, kind: TitleKind) -> Color32 {
 fn extract_button(ui: &mut egui::Ui, busy: bool, has_base: bool) -> bool {
     let tip = if has_base { "Extract the game, with its update applied, to a folder" } else { "Needs the base game" };
     theme::secondary_button(ui, !busy && has_base, "Extract…").on_hover_text(tip).on_disabled_hover_text(tip).clicked()
+}
+
+/// The "NSPs…" button on a game card. Returns true when clicked.
+fn nsp_button(ui: &mut egui::Ui, busy: bool, any: bool) -> bool {
+    let tip = "Write the base game, update and each DLC to separate NSP files";
+    theme::secondary_button(ui, !busy && any, "NSPs…").on_hover_text(tip).on_disabled_hover_text(tip).clicked()
 }
 
 fn game_card(
@@ -1702,6 +1836,9 @@ fn game_card(
                         if extract_button(ui, busy, has_base) {
                             action = CardAction::Extract;
                         }
+                        if nsp_button(ui, busy, can_build) {
+                            action = CardAction::Nsp;
+                        }
                         status_pill(ui, p.ok, kind.done());
                     }
                     Status::Building { kind, done, total } => {
@@ -1718,6 +1855,9 @@ fn game_card(
                         if extract_button(ui, busy, has_base) {
                             action = CardAction::Extract;
                         }
+                        if nsp_button(ui, busy, can_build) {
+                            action = CardAction::Nsp;
+                        }
                         status_pill(ui, p.err, "Failed").on_hover_text(e);
                     }
                     Status::Ready => {
@@ -1726,6 +1866,9 @@ fn game_card(
                         }
                         if extract_button(ui, busy, has_base) {
                             action = CardAction::Extract;
+                        }
+                        if nsp_button(ui, busy, can_build) {
+                            action = CardAction::Nsp;
                         }
                     }
                 }
@@ -2067,6 +2210,9 @@ impl eframe::App for App {
         }
         if self.extract_dialog.is_some() {
             self.extract_modal(ctx);
+        }
+        if self.nsp_dialog.is_some() {
+            self.nsp_modal(ctx);
         }
 
         if hovering && !self.games.is_empty() {

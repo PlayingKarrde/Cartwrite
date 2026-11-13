@@ -3,15 +3,16 @@
 //!   cartwrite-cli info  [--regions | --regions-from URL|DIR] <files/folders...>
 //!   cartwrite-cli check [--titledb URL|FILE] [--refresh] <files/folders...>
 //!   cartwrite-cli build [-o DIR] [--no-rsv] [--fat32] [--deltas] [--keys FILE] <files/folders...>
+//!   cartwrite-cli nsp   [-o DIR] [--no-rsv] [--deltas] [--keys FILE] <files/folders...>
 //!   cartwrite-cli extract [-o DIR] [--with-dlc] [--overwrite] [--keys FILE] <files/folders...>
 
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
-use cartwrite_core::build::{build_xci, BuildOptions, Progress};
+use cartwrite_core::build::{build_nsp, build_xci, BuildOptions, Progress};
 use cartwrite_core::extract::{extract_game, ExtractOptions};
-use cartwrite_core::plan::{group, output_stem};
+use cartwrite_core::plan::{group, output_stem, title_stem};
 use cartwrite_core::regions::{self, Region};
 use cartwrite_core::rsv::format_rsv;
 use cartwrite_core::scan::{collect_files, scan_file, Title, TitleKind};
@@ -22,6 +23,7 @@ use cartwrite_core::Keys;
 const USAGE: &str = "usage: cartwrite-cli info [--regions | --regions-from URL|DIR] <files...>
        cartwrite-cli check [--titledb URL|FILE] [--refresh] <files...>
        cartwrite-cli build [-o DIR] [--no-rsv] [--fat32] [--deltas] [--keys FILE] <files...>
+       cartwrite-cli nsp [-o DIR] [--no-rsv] [--deltas] [--keys FILE] <files...>
        cartwrite-cli extract [-o DIR] [--with-dlc] [--overwrite] [--keys FILE] <files...>";
 
 fn main() {
@@ -64,7 +66,7 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
             _ => inputs.push(PathBuf::from(a)),
         }
     }
-    if !matches!(cmd.as_str(), "info" | "check" | "build" | "extract") || inputs.is_empty() {
+    if !matches!(cmd.as_str(), "info" | "check" | "build" | "nsp" | "extract") || inputs.is_empty() {
         eprintln!("{USAGE}");
         std::process::exit(2);
     }
@@ -161,6 +163,34 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
                 Err(e) => {
                     eprintln!("  failed: {e}");
                     all_ok = false;
+                }
+            }
+        }
+    } else if cmd == "nsp" {
+        let cancel = AtomicBool::new(false);
+        for g in &games {
+            let sel: Vec<&Title> = g.titles.iter().collect();
+            let dir = out_dir.clone().unwrap_or_else(|| PathBuf::from("output")).join(output_stem(
+                &g.name,
+                g.application_id,
+                &sel,
+            ));
+            for t in &sel {
+                let path = dir.join(format!("{}.nsp", title_stem(&g.name, t)));
+                println!(
+                    "
+Writing {}",
+                    path.display()
+                );
+                let start = Instant::now();
+                let result = build_nsp(&keys, t, &path, &opts, &cancel, &mut print_progress());
+                eprintln!();
+                match result {
+                    Ok(_) => println!("  done in {:.1}s", start.elapsed().as_secs_f64()),
+                    Err(e) => {
+                        eprintln!("  failed: {e}");
+                        all_ok = false;
+                    }
                 }
             }
         }

@@ -10,8 +10,9 @@ use std::sync::mpsc::{channel, Receiver};
 use std::sync::Arc;
 use std::time::Instant;
 
-use cartwrite_core::build::{build_xci, BuildOptions, Progress};
+use cartwrite_core::build::{build_nsp, build_xci, BuildOptions, Progress};
 use cartwrite_core::extract::{extract_game, ExtractOptions};
+use cartwrite_core::plan::title_stem;
 use cartwrite_core::regions::{self, Region, RegionDb};
 use cartwrite_core::scan::{collect_files, scan_file, Title};
 use cartwrite_core::titledb::{self, TitleDb};
@@ -141,6 +142,66 @@ pub fn spawn_build(
                 break;
             }
         }
+        let _ = tx.send(BuildMsg::AllDone);
+        ctx.request_repaint();
+    });
+    rx
+}
+
+pub struct NspJob {
+    pub application_id: u64,
+    pub name: String,
+    pub titles: Vec<Title>,
+    /// Folder the NSPs are written to.
+    pub dir: PathBuf,
+}
+
+/// Writes every title of one game to its own NSP. Reports through the same messages as [`spawn_build`];
+/// the byte counts run across all files so the bar fills once.
+pub fn spawn_nsps(
+    ctx: eframe::egui::Context,
+    keys: Arc<Keys>,
+    job: NspJob,
+    opts: BuildOptions,
+    cancel: Arc<AtomicBool>,
+) -> Receiver<BuildMsg> {
+    let (tx, rx) = channel();
+    std::thread::spawn(move || {
+        let id = job.application_id;
+        let _ = tx.send(BuildMsg::Started(id));
+        let sizes: Vec<u64> = job.titles.iter().map(|t| t.size(opts.include_deltas)).collect();
+        let grand: u64 = sizes.iter().sum();
+        let mut last = Instant::now();
+        let result = guarded(|| {
+            let mut written = Vec::new();
+            let mut before = 0u64;
+            for (t, size) in job.titles.iter().zip(&sizes) {
+                let path = job.dir.join(format!("{}.nsp", title_stem(&job.name, t)));
+                written.extend(build_nsp(&keys, t, &path, &opts, &cancel, &mut |p| {
+                    let p = match p {
+                        Progress::Bytes { done, .. } => {
+                            Progress::Bytes { done: before + done.min(*size), total: grand }
+                        }
+                        log => log,
+                    };
+                    let throttle = matches!(p, Progress::Bytes { done, total } if done != total);
+                    if throttle && last.elapsed().as_millis() < 100 {
+                        return;
+                    }
+                    last = Instant::now();
+                    let _ = tx.send(BuildMsg::Progress(id, p));
+                    ctx.request_repaint();
+                })?);
+                before += size;
+            }
+            Ok(written)
+        });
+        let msg = match result {
+            Ok(paths) => BuildMsg::Finished(id, Ok(paths)),
+            Err(Error::Cancelled) => BuildMsg::Cancelled(id),
+            Err(e) => BuildMsg::Finished(id, Err(e.to_string())),
+        };
+        let _ = tx.send(msg);
         let _ = tx.send(BuildMsg::AllDone);
         ctx.request_repaint();
     });
