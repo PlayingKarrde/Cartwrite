@@ -31,7 +31,10 @@ PLATFORMS = {
         "contents": "cartwrite      The desktop app. Run ./cartwrite.\n"
         "cartwrite-cli  The command-line version, for scripts.",
         "notes": "\nThe app needs an X11 or Wayland desktop. Its file dialogs use the XDG desktop\n"
-        "portal (xdg-desktop-portal), which most desktops include.\n",
+        "portal (xdg-desktop-portal), which most desktops include. On Wayland it runs\n"
+        "through XWayland so you can drag games in from your file manager; start it with\n"
+        "CARTWRITE_WAYLAND=1 ./cartwrite to run it as a native Wayland app instead (drag\n"
+        "and drop won't work then).\n",
     },
     "macos": {
         "name": "macOS (Apple silicon and Intel)",

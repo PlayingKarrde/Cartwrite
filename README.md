@@ -40,7 +40,9 @@ Download the package for your system from the [Releases](../../releases) page:
 
 - **Windows:** `Cartwrite-<version>-windows-x64.zip`. Extract it anywhere and run `cartwrite.exe`.
 - **Linux:** `Cartwrite-<version>-linux-x64.tar.gz`. Extract it and run `./cartwrite`. It needs an
-  X11 or Wayland desktop, and its file dialogs use the XDG desktop portal.
+  X11 or Wayland desktop, and its file dialogs use the XDG desktop portal. On Wayland it runs
+  through XWayland so you can drag games in from your file manager; set `CARTWRITE_WAYLAND=1`
+  to run it as a native Wayland app instead (drag and drop won't work then).
 - **macOS:** `Cartwrite-<version>-macos-universal.tar.gz`, for Apple silicon and Intel Macs.
   Extract it and open `Cartwrite.app`. The app isn't signed by Apple, so the first time,
   right-click it and choose **Open**.

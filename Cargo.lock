@@ -605,6 +605,7 @@ dependencies = [
  "image",
  "rfd",
  "serde",
+ "winit",
  "winresource",
 ]
 
